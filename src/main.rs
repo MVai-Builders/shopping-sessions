@@ -3,13 +3,13 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Date32Array, Int64Array, StringArray};
+use arrow::array::{
+    ArrayRef, Date32Array, Int64Array, RecordBatch, StringArray,
+};
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashMap;
 use memmap2::Mmap;
 use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
 use serde::Deserialize;
@@ -80,12 +80,9 @@ fn parse_iso_f1(s: &[u8]) -> Option<i64> {
     let d = parse_2_digits(&s[8..10])?;
     let h = parse_2_digits(&s[11..13])?;
     let mi = parse_2_digits(&s[14..16])?;
-    let sec = parse_2_digits(&s[17..19])?;
-    if !(1..=12).contains(&m)
-        || !(0..=23).contains(&h)
-        || !(0..=59).contains(&mi)
-        || !(0..=59).contains(&sec)
-    {
+    let se = parse_2_digits(&s[17..19])?;
+
+    if !(1..=12).contains(&m) || !(0..=23).contains(&h) || !(0..=59).contains(&mi) || !(0..=59).contains(&se) {
         return None;
     }
     let dim = [0, 31, if is_leap(y) { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
@@ -93,7 +90,7 @@ fn parse_iso_f1(s: &[u8]) -> Option<i64> {
         return None;
     }
     let ed = days_from_civil(y, m, d) as i64;
-    Some((ed * 86400 + h * 3600 + mi * 60 + sec) * 1000)
+    Some((ed * 86400 + h * 3600 + mi * 60 + se) * 1000)
 }
 
 #[inline(always)]
@@ -122,17 +119,17 @@ fn parse_iso_f2(s: &[u8]) -> Option<i64> {
     let d = parse_2_digits(&s[8..10])?;
     let h = parse_2_digits(&s[11..13])?;
     let mi = parse_2_digits(&s[14..16])?;
-    let sec = parse_2_digits(&s[17..19])?;
+    let se = parse_2_digits(&s[17..19])?;
     let oh = parse_2_digits(&s[20..22])?;
     let omi = parse_2_digits(&s[23..25])?;
+
     if !(1..=12).contains(&m)
         || !(0..=23).contains(&h)
         || !(0..=59).contains(&mi)
-        || !(0..=59).contains(&sec)
+        || !(0..=59).contains(&se)
+        || !(0..=23).contains(&oh)
+        || !(0..=59).contains(&omi)
     {
-        return None;
-    }
-    if !(0..=23).contains(&oh) || !(0..=59).contains(&omi) {
         return None;
     }
     let dim = [0, 31, if is_leap(y) { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
@@ -140,28 +137,25 @@ fn parse_iso_f2(s: &[u8]) -> Option<i64> {
         return None;
     }
     let ed = days_from_civil(y, m, d) as i64;
-    let local_sec = ed * 86400 + h * 3600 + mi * 60 + sec;
-    let offset_sec = oh * 3600 + omi * 60;
-    let utc_sec = if sign == b'+' {
-        local_sec - offset_sec
+    let local_secs = ed * 86400 + h * 3600 + mi * 60 + se;
+    let offset_secs = oh * 3600 + omi * 60;
+    let utc_secs = if sign == b'+' {
+        local_secs - offset_secs
     } else {
-        local_sec + offset_sec
+        local_secs + offset_secs
     };
-    Some(utc_sec * 1000)
+    Some(utc_secs * 1000)
 }
 
 #[inline(always)]
 fn parse_timestamp(s: &[u8]) -> Option<i64> {
-    if s.is_empty() {
-        return None;
-    }
-    if s.ends_with(b"Z") {
+    if s.len() == 20 && s[19] == b'Z' {
         return parse_iso_f1(s);
     }
     if s.len() == 25 && (s[19] == b'+' || s[19] == b'-') {
         return parse_iso_f2(s);
     }
-    if s.iter().all(|&b| b.is_ascii_digit()) {
+    if !s.is_empty() && s.iter().all(|&b| b.is_ascii_digit()) {
         let mut val = 0i64;
         for &b in s {
             val = val.checked_mul(10)?.checked_add((b - b'0') as i64)?;
@@ -200,25 +194,84 @@ fn unquote_field(mut s: &[u8]) -> Option<&[u8]> {
 }
 
 #[inline(always)]
-fn parse_line<'a>(line: &'a [u8], expected_cols: usize, out: &mut Vec<&'a [u8]>) -> bool {
-    out.clear();
+fn parse_line_7<'a>(line: &'a [u8], cols: &mut [&'a [u8]; 7]) -> bool {
     let mut start = 0;
+    let mut col_idx = 0;
     for (i, &b) in line.iter().enumerate() {
         if b == b',' {
-            let field = unquote_field(&line[start..i]);
-            match field {
-                Some(f) => out.push(f),
-                None => return false,
+            if col_idx >= 6 {
+                return false;
             }
+            let Some(f) = unquote_field(&line[start..i]) else {
+                return false;
+            };
+            cols[col_idx] = f;
+            col_idx += 1;
             start = i + 1;
         }
     }
-    let field = unquote_field(&line[start..]);
-    match field {
-        Some(f) => out.push(f),
-        None => return false,
+    if col_idx != 6 {
+        return false;
     }
-    out.len() == expected_cols
+    let Some(f) = unquote_field(&line[start..]) else {
+        return false;
+    };
+    cols[6] = f;
+    true
+}
+
+#[inline(always)]
+fn parse_line_4<'a>(line: &'a [u8], cols: &mut [&'a [u8]; 4]) -> bool {
+    let mut start = 0;
+    let mut col_idx = 0;
+    for (i, &b) in line.iter().enumerate() {
+        if b == b',' {
+            if col_idx >= 3 {
+                return false;
+            }
+            let Some(f) = unquote_field(&line[start..i]) else {
+                return false;
+            };
+            cols[col_idx] = f;
+            col_idx += 1;
+            start = i + 1;
+        }
+    }
+    if col_idx != 3 {
+        return false;
+    }
+    let Some(f) = unquote_field(&line[start..]) else {
+        return false;
+    };
+    cols[3] = f;
+    true
+}
+
+#[inline(always)]
+fn parse_line_2<'a>(line: &'a [u8], cols: &mut [&'a [u8]; 2]) -> bool {
+    let mut start = 0;
+    let mut col_idx = 0;
+    for (i, &b) in line.iter().enumerate() {
+        if b == b',' {
+            if col_idx >= 1 {
+                return false;
+            }
+            let Some(f) = unquote_field(&line[start..i]) else {
+                return false;
+            };
+            cols[col_idx] = f;
+            col_idx += 1;
+            start = i + 1;
+        }
+    }
+    if col_idx != 1 {
+        return false;
+    }
+    let Some(f) = unquote_field(&line[start..]) else {
+        return false;
+    };
+    cols[1] = f;
+    true
 }
 
 // ─── DSU for Linked IDs ──────────────────────────────────────────────────────
@@ -261,15 +314,25 @@ impl Dsu {
     }
 }
 
-// ─── Event Struct ────────────────────────────────────────────────────────────
+// ─── Compact Zero-Allocation Event Struct ────────────────────────────────────
 
-#[derive(Clone)]
-struct CompactEvent {
-    person: Arc<[u8]>,
+#[derive(Clone, Copy)]
+struct FastEvent<'a> {
+    person_hash: u64,
+    person: &'a [u8],
     ts: i64,
     price_cents: u32,
     etype: u8,
-    category: Arc<str>,
+    category: u8,
+}
+
+#[derive(Clone, Copy)]
+struct FastClick<'a> {
+    person_hash: u64,
+    person: &'a [u8],
+    cid: &'a [u8],
+    ts: i64,
+    camp_id: u16,
 }
 
 // ─── Main Pipeline ───────────────────────────────────────────────────────────
@@ -281,46 +344,72 @@ struct Manifest {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let data_dir = env::var("DATA_DIR").unwrap_or_else(|_| "/data".to_string());
-    let out_dir = env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".to_string());
+    let args: Vec<String> = env::args().collect();
+    let (data_dir, output_dir) = if args.len() >= 3 {
+        (args[1].clone(), args[2].clone())
+    } else {
+        ("/data".to_string(), "/output".to_string())
+    };
 
-    let manifest_bytes = fs::read(Path::new(&data_dir).join("manifest.json"))?;
-    let manifest: Manifest = serde_json::from_slice(&manifest_bytes)?;
-    let w_start = parse_iso_f1(manifest.window_start.as_bytes()).expect("bad window_start");
-    let w_end = parse_iso_f1(manifest.window_end.as_bytes()).expect("bad window_end");
+    let manifest_path = Path::new(&data_dir).join("manifest.json");
+    let manifest_content = fs::read_to_string(manifest_path)?;
+    let manifest: Manifest = serde_json::from_str(&manifest_content)?;
+
+    let w_start = parse_iso_f1(manifest.window_start.as_bytes()).expect("valid window_start");
+    let w_end = parse_iso_f1(manifest.window_end.as_bytes()).expect("valid window_end");
     let click_w_start = w_start - 7 * 86400 * 1000;
 
     // 1. Categories & Products
-    let unknown_cat: Arc<str> = "unknown".into();
-    let mut products: HashMap<Vec<u8>, Arc<str>> = HashMap::with_capacity(65536);
+    let mut cat_names: Vec<String> = Vec::with_capacity(32);
+    cat_names.push("unknown".to_string());
+    let unknown_cat_id = 0u8;
+
+    let mut cat_map: HashMap<Vec<u8>, u8> = HashMap::with_capacity(32);
+    cat_map.insert(b"unknown".to_vec(), 0u8);
+
+    let mut products: HashMap<Vec<u8>, u8> = HashMap::with_capacity(65536);
     let p_path = Path::new(&data_dir).join("products.csv");
     if p_path.exists() {
         let content = fs::read(&p_path)?;
-        let mut cols = Vec::with_capacity(2);
+        let mut cols = [b"".as_slice(); 2];
         for line in content.split(|&b| b == b'\n').skip(1) {
             if line.is_empty() {
                 continue;
             }
-            if parse_line(line, 2, &mut cols) && !cols[0].is_empty() {
-                let cat_str: Arc<str> = String::from_utf8_lossy(cols[1]).into();
-                products.insert(cols[0].to_vec(), cat_str);
+            if parse_line_2(line, &mut cols) && !cols[0].is_empty() {
+                let cat_bytes = cols[1];
+                let next_id = cat_names.len() as u8;
+                let cat_id = *cat_map.entry(cat_bytes.to_vec()).or_insert_with(|| {
+                    cat_names.push(String::from_utf8_lossy(cat_bytes).to_string());
+                    next_id
+                });
+                products.insert(cols[0].to_vec(), cat_id);
             }
         }
     }
 
     // 2. Campaigns
-    let mut campaigns: HashMap<Vec<u8>, Arc<str>> = HashMap::with_capacity(4096);
+    let mut campaign_names: Vec<(String, String)> = Vec::with_capacity(1024);
+    // Index 0 is reserved for "organic"
+    campaign_names.push(("organic".to_string(), "organic".to_string()));
+    const ORGANIC_CAMP_ID: u16 = 0;
+
+    let mut campaign_map: HashMap<Vec<u8>, u16> = HashMap::with_capacity(1024);
     let c_path = Path::new(&data_dir).join("campaigns.csv");
     if c_path.exists() {
         let content = fs::read(&c_path)?;
-        let mut cols = Vec::with_capacity(2);
+        let mut cols = [b"".as_slice(); 2];
         for line in content.split(|&b| b == b'\n').skip(1) {
             if line.is_empty() {
                 continue;
             }
-            if parse_line(line, 2, &mut cols) && !cols[0].is_empty() {
-                let ch_str: Arc<str> = String::from_utf8_lossy(cols[1]).into();
-                campaigns.insert(cols[0].to_vec(), ch_str);
+            if parse_line_2(line, &mut cols) && !cols[0].is_empty() {
+                let camp_id = campaign_names.len() as u16;
+                campaign_names.push((
+                    String::from_utf8_lossy(cols[0]).to_string(),
+                    String::from_utf8_lossy(cols[1]).to_string(),
+                ));
+                campaign_map.insert(cols[0].to_vec(), camp_id);
             }
         }
     }
@@ -335,27 +424,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for lf in link_files {
         let content = fs::read(lf)?;
-        let mut cols = Vec::with_capacity(2);
+        let mut cols = [b"".as_slice(); 2];
         for line in content.split(|&b| b == b'\n').skip(1) {
             if line.is_empty() {
                 continue;
             }
-            if parse_line(line, 2, &mut cols) && !cols[0].is_empty() && !cols[1].is_empty() {
+            if parse_line_2(line, &mut cols) && !cols[0].is_empty() && !cols[1].is_empty() {
                 dsu.union(cols[0], cols[1]);
             }
         }
     }
 
-    // Pre-resolve DSU into a shared read-only map
-    let mut resolved_links: HashMap<Vec<u8>, Arc<[u8]>> = HashMap::with_capacity(dsu.parent.len());
+    // Pre-resolve DSU into a shared read-only map: (hash, Arc<[u8]>)
+    let mut resolved_links: HashMap<Vec<u8>, (u64, Arc<[u8]>)> = HashMap::with_capacity(dsu.parent.len());
     let keys: Vec<Vec<u8>> = dsu.parent.keys().cloned().collect();
     for k in keys {
         let root = dsu.find(&k);
-        resolved_links.insert(k, Arc::from(root.into_boxed_slice()));
+        let h = fnv1a(&root);
+        resolved_links.insert(k, (h, Arc::from(root.into_boxed_slice())));
     }
     let resolved_links = Arc::new(resolved_links);
 
-    // 4. Events: PARALLEL PARSE & DETERMINISTIC SHARD DEDUP
+    // 4. Events: PARALLEL PARSE & FAST SORT DEDUP
     let events_pattern = format!("{}/events/*.csv", data_dir);
     let mut event_files: Vec<PathBuf> = glob::glob(&events_pattern)?
         .filter_map(Result::ok)
@@ -372,15 +462,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[derive(Clone, Copy)]
     struct EventLoc {
+        eid_hash: u64,
+        ingest_ms: i64,
         file_idx: u32,
         line_offset: u32,
         line_len: u32,
-        ingest_ms: i64,
     }
 
     const NUM_SHARDS: usize = 64;
 
-    // Phase 4a: Parse files once in parallel, each producing a 64-shard table
+    // Phase 4a: Scan files in parallel once into shard buffers
     let thread_shards: Vec<Vec<Vec<EventLoc>>> = mmaps
         .par_iter()
         .enumerate()
@@ -388,7 +479,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut shards: Vec<Vec<EventLoc>> = (0..NUM_SHARDS)
                 .map(|_| Vec::with_capacity(mmap.len() / (80 * NUM_SHARDS)))
                 .collect();
-            let mut cols = Vec::with_capacity(7);
+            let mut cols = [b"".as_slice(); 7];
             let mut start = 0;
             let bytes = mmap.as_ref();
             let mut line_num = 0;
@@ -402,17 +493,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
 
-                    if parse_line(line, 7, &mut cols) {
+                    if parse_line_7(line, &mut cols) {
                         let eid = cols[0];
                         if !eid.is_empty() {
                             if let Some(ingest_ms) = parse_iso_f1(cols[3]) {
                                 let eid_hash = fnv1a(eid);
                                 let shard = (eid_hash as usize) % NUM_SHARDS;
                                 shards[shard].push(EventLoc {
+                                    eid_hash,
+                                    ingest_ms,
                                     file_idx: f_idx as u32,
                                     line_offset: (line.as_ptr() as usize - bytes.as_ptr() as usize) as u32,
                                     line_len: line.len() as u32,
-                                    ingest_ms,
                                 });
                             }
                         }
@@ -421,17 +513,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if start < bytes.len() {
                 let line = &bytes[start..];
-                if line_num > 0 && !line.is_empty() && parse_line(line, 7, &mut cols) {
+                if line_num > 0 && !line.is_empty() && parse_line_7(line, &mut cols) {
                     let eid = cols[0];
                     if !eid.is_empty() {
                         if let Some(ingest_ms) = parse_iso_f1(cols[3]) {
                             let eid_hash = fnv1a(eid);
                             let shard = (eid_hash as usize) % NUM_SHARDS;
                             shards[shard].push(EventLoc {
+                                eid_hash,
+                                ingest_ms,
                                 file_idx: f_idx as u32,
                                 line_offset: (line.as_ptr() as usize - bytes.as_ptr() as usize) as u32,
                                 line_len: line.len() as u32,
-                                ingest_ms,
                             });
                         }
                     }
@@ -445,49 +538,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mmaps_ref = &mmaps;
     let products_ref = &products;
     let resolved_links_ref = &resolved_links;
-    let unknown_cat_ref = &unknown_cat;
 
-    let shard_valid_events: Vec<Vec<CompactEvent>> = (0..NUM_SHARDS)
+    let shard_valid_events: Vec<Vec<FastEvent>> = (0..NUM_SHARDS)
         .into_par_iter()
         .map(|shard_idx| {
-            // Collect all locs for this shard from all threads
             let total_locs: usize = thread_shards.iter().map(|ts| ts[shard_idx].len()).sum();
             let mut locs = Vec::with_capacity(total_locs);
             for ts in &thread_shards {
                 locs.extend_from_slice(&ts[shard_idx]);
             }
 
-            // Deduplicate on eid: keep lowest ingest_ms
-            let mut map: HashMap<&[u8], EventLoc> = HashMap::with_capacity(locs.len());
-            let mut cols = Vec::with_capacity(7);
-            for loc in locs {
-                let bytes = &mmaps_ref[loc.file_idx as usize][loc.line_offset as usize..(loc.line_offset + loc.line_len) as usize];
-                if parse_line(bytes, 7, &mut cols) {
-                    let eid = cols[0];
-                    if let Some(existing) = map.get_mut(eid) {
-                        if loc.ingest_ms < existing.ingest_ms {
-                            *existing = loc;
-                        }
+            // In-place sort by (eid_hash, ingest_ms)
+            locs.sort_unstable_by(|a, b| {
+                a.eid_hash
+                    .cmp(&b.eid_hash)
+                    .then_with(|| a.ingest_ms.cmp(&b.ingest_ms))
+            });
+
+            let mut valid = Vec::with_capacity(locs.len());
+            let mut i = 0;
+            while i < locs.len() {
+                let best_loc = locs[i];
+                let best_line = &mmaps_ref[best_loc.file_idx as usize][best_loc.line_offset as usize..(best_loc.line_offset + best_loc.line_len) as usize];
+                let mut cols_best = [b"".as_slice(); 7];
+                parse_line_7(best_line, &mut cols_best);
+                let best_eid = cols_best[0];
+
+                let mut j = i + 1;
+                while j < locs.len() && locs[j].eid_hash == best_loc.eid_hash {
+                    let other_line = &mmaps_ref[locs[j].file_idx as usize][locs[j].line_offset as usize..(locs[j].line_offset + locs[j].line_len) as usize];
+                    let mut cols_other = [b"".as_slice(); 7];
+                    if parse_line_7(other_line, &mut cols_other) && cols_other[0] == best_eid {
+                        j += 1;
                     } else {
-                        map.insert(eid, loc);
+                        break;
                     }
                 }
-            }
+                i = j;
 
-            // Validate surviving events in this shard
-            let mut valid = Vec::with_capacity(map.len());
-            for loc in map.into_values() {
-                let bytes = &mmaps_ref[loc.file_idx as usize][loc.line_offset as usize..(loc.line_offset + loc.line_len) as usize];
-                if !parse_line(bytes, 7, &mut cols) {
-                    continue;
-                }
-                let uid_bytes = cols[1];
-                let pid_bytes = cols[5];
+                // Validate best_loc
+                let uid_bytes = cols_best[1];
+                let pid_bytes = cols_best[5];
                 if uid_bytes.is_empty() || pid_bytes.is_empty() {
                     continue;
                 }
 
-                let etype = match cols[4] {
+                let etype = match cols_best[4] {
                     b"view" => 1u8,
                     b"cart" => 2u8,
                     b"purchase" => 3u8,
@@ -496,40 +592,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let mut price_cents = 0u32;
                 if etype == 3 {
-                    if cols[6].is_empty() || !cols[6].iter().all(|b| b.is_ascii_digit()) {
+                    let pr = cols_best[6];
+                    if pr.is_empty() || !pr.iter().all(|&b| b.is_ascii_digit()) {
                         continue;
                     }
-                    let Ok(p) = std::str::from_utf8(cols[6]).unwrap().parse::<u32>() else {
-                        continue;
-                    };
+                    let mut p = 0u64;
+                    for &b in pr {
+                        p = p * 10 + (b - b'0') as u64;
+                        if p > 10_000_000 {
+                            break;
+                        }
+                    }
                     if !(1..=10_000_000).contains(&p) {
                         continue;
                     }
-                    price_cents = p;
+                    price_cents = p as u32;
                 }
 
-                let Some(ts) = parse_timestamp(cols[2]) else {
+                let Some(ts) = parse_timestamp(cols_best[2]) else {
                     continue;
                 };
                 if ts < w_start || ts >= w_end {
                     continue;
                 }
-                if (loc.ingest_ms - ts) > 86400 * 1000 {
+                if (best_loc.ingest_ms - ts) > 86400 * 1000 {
                     continue;
                 }
 
-                let person: Arc<[u8]> = match resolved_links_ref.get(uid_bytes) {
-                    Some(root) => root.clone(),
-                    None => Arc::from(uid_bytes.to_vec().into_boxed_slice()),
+                let (person_hash, person_bytes): (u64, &[u8]) = match resolved_links_ref.get(uid_bytes) {
+                    Some(root) => (root.0, &root.1),
+                    None => (fnv1a(uid_bytes), uid_bytes),
                 };
 
-                let category = match products_ref.get(pid_bytes) {
-                    Some(c) => c.clone(),
-                    None => unknown_cat_ref.clone(),
-                };
+                let category = *products_ref.get(pid_bytes).unwrap_or(&unknown_cat_id);
 
-                valid.push(CompactEvent {
-                    person,
+                valid.push(FastEvent {
+                    person_hash,
+                    person: person_bytes,
                     ts,
                     price_cents,
                     etype,
@@ -542,57 +641,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Flatten all valid events
     let total_valid: usize = shard_valid_events.iter().map(|s| s.len()).sum();
-    let mut valid_events: Vec<CompactEvent> = Vec::with_capacity(total_valid);
+    let mut valid_events: Vec<FastEvent> = Vec::with_capacity(total_valid);
     for s in shard_valid_events {
         valid_events.extend(s);
     }
 
-    // 5. PARALLEL SORT EVENTS BY (PERSON, TS)
+    // 5. PARALLEL SORT EVENTS BY (PERSON_HASH, PERSON, TS)
     valid_events.par_sort_unstable_by(|a, b| {
-        a.person.cmp(&b.person).then_with(|| a.ts.cmp(&b.ts))
+        a.person_hash
+            .cmp(&b.person_hash)
+            .then_with(|| a.person.cmp(b.person))
+            .then_with(|| a.ts.cmp(&b.ts))
     });
 
-    // 6. Clicks: PARALLEL PARSE & DEDUP
+    // 6. Clicks: PARALLEL PARSE & SORT DEDUP
     let clicks_pattern = format!("{}/clicks/*.csv", data_dir);
     let mut click_files: Vec<PathBuf> = glob::glob(&clicks_pattern)?
         .filter_map(Result::ok)
         .collect();
     click_files.sort();
 
-    struct RawClick {
-        cid: Vec<u8>,
+    let click_mmaps: Vec<Mmap> = click_files
+        .iter()
+        .map(|cf| {
+            let file = File::open(cf).expect("open click file");
+            unsafe { Mmap::map(&file).expect("mmap click file") }
+        })
+        .collect();
+
+    #[derive(Clone, Copy)]
+    struct RawClickLoc {
+        cid_hash: u64,
         ts: i64,
-        uid: Vec<u8>,
-        camp_id: Arc<str>,
+        f_idx: u32,
+        line_offset: u32,
+        line_len: u32,
     }
 
-    let per_file_clicks: Vec<Vec<RawClick>> = click_files
+    let per_file_raw_clicks: Vec<Vec<RawClickLoc>> = click_mmaps
         .par_iter()
-        .map(|cf| {
-            let mut clicks = Vec::new();
-            if let Ok(file) = File::open(cf) {
-                if let Ok(mmap) = unsafe { Mmap::map(&file) } {
-                    let mut cols = Vec::with_capacity(4);
-                    for line in mmap.split(|&b| b == b'\n').skip(1) {
-                        if line.is_empty() {
-                            continue;
-                        }
-                        if !parse_line(line, 4, &mut cols) {
-                            continue;
-                        }
+        .enumerate()
+        .map(|(f_idx, mmap)| {
+            let mut list = Vec::with_capacity(mmap.len() / 60);
+            let mut cols = [b"".as_slice(); 4];
+            let mut start = 0;
+            let bytes = mmap.as_ref();
+            let mut line_num = 0;
+
+            for (i, &b) in bytes.iter().enumerate() {
+                if b == b'\n' {
+                    let line = &bytes[start..i];
+                    start = i + 1;
+                    line_num += 1;
+                    if line_num == 1 || line.is_empty() {
+                        continue;
+                    }
+                    if parse_line_4(line, &mut cols) {
                         let cid = cols[0];
-                        let uid = cols[1];
-                        if cid.is_empty() || uid.is_empty() {
-                            continue;
-                        }
-                        if campaigns.contains_key(cols[2]) {
+                        if !cid.is_empty() {
                             if let Some(ts) = parse_timestamp(cols[3]) {
                                 if ts >= click_w_start && ts < w_end {
-                                    clicks.push(RawClick {
-                                        cid: cid.to_vec(),
+                                    list.push(RawClickLoc {
+                                        cid_hash: fnv1a(cid),
                                         ts,
-                                        uid: uid.to_vec(),
-                                        camp_id: String::from_utf8_lossy(cols[2]).into(),
+                                        f_idx: f_idx as u32,
+                                        line_offset: (line.as_ptr() as usize - bytes.as_ptr() as usize) as u32,
+                                        line_len: line.len() as u32,
                                     });
                                 }
                             }
@@ -600,46 +714,104 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            clicks
+            if start < bytes.len() {
+                let line = &bytes[start..];
+                if line_num > 0 && !line.is_empty() && parse_line_4(line, &mut cols) {
+                    let cid = cols[0];
+                    if !cid.is_empty() {
+                        if let Some(ts) = parse_timestamp(cols[3]) {
+                            if ts >= click_w_start && ts < w_end {
+                                list.push(RawClickLoc {
+                                    cid_hash: fnv1a(cid),
+                                    ts,
+                                    f_idx: f_idx as u32,
+                                    line_offset: (line.as_ptr() as usize - bytes.as_ptr() as usize) as u32,
+                                    line_len: line.len() as u32,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            list
         })
         .collect();
 
-    // Deduplicate clicks on click_id
-    let mut seen_clicks: HashSet<Vec<u8>> = HashSet::with_capacity(500_000);
-    let mut valid_clicks_by_person: HashMap<Arc<[u8]>, Vec<(i64, Vec<u8>, Arc<str>)>> = HashMap::with_capacity(500_000);
+    let total_raw_clicks: usize = per_file_raw_clicks.iter().map(|c| c.len()).sum();
+    let mut all_raw_clicks = Vec::with_capacity(total_raw_clicks);
+    for fc in per_file_raw_clicks {
+        all_raw_clicks.extend(fc);
+    }
 
-    for file_clicks in per_file_clicks {
-        for c in file_clicks {
-            if !seen_clicks.insert(c.cid.clone()) {
-                continue;
+    all_raw_clicks.par_sort_unstable_by(|a, b| a.cid_hash.cmp(&b.cid_hash));
+
+    let mut valid_clicks: Vec<FastClick> = Vec::with_capacity(all_raw_clicks.len());
+    let mut c_idx = 0;
+    while c_idx < all_raw_clicks.len() {
+        let best_c = all_raw_clicks[c_idx];
+        let best_line = &click_mmaps[best_c.f_idx as usize][best_c.line_offset as usize..(best_c.line_offset + best_c.line_len) as usize];
+        let mut cols_best = [b"".as_slice(); 4];
+        parse_line_4(best_line, &mut cols_best);
+        let best_cid = cols_best[0];
+
+        let mut next_c = c_idx + 1;
+        while next_c < all_raw_clicks.len() && all_raw_clicks[next_c].cid_hash == best_c.cid_hash {
+            let other_line = &click_mmaps[all_raw_clicks[next_c].f_idx as usize][all_raw_clicks[next_c].line_offset as usize..(all_raw_clicks[next_c].line_offset + all_raw_clicks[next_c].line_len) as usize];
+            let mut cols_other = [b"".as_slice(); 4];
+            if parse_line_4(other_line, &mut cols_other) && cols_other[0] == best_cid {
+                next_c += 1;
+            } else {
+                break;
             }
-            let person: Arc<[u8]> = match resolved_links.get(&c.uid) {
-                Some(root) => root.clone(),
-                None => Arc::from(c.uid.into_boxed_slice()),
-            };
-
-            valid_clicks_by_person
-                .entry(person)
-                .or_default()
-                .push((c.ts, c.cid, c.camp_id));
         }
+        c_idx = next_c;
+
+        let uid_bytes = cols_best[1];
+        let camp_bytes = cols_best[2];
+        if uid_bytes.is_empty() {
+            continue;
+        }
+
+        let Some(&camp_id) = campaign_map.get(camp_bytes) else {
+            continue;
+        };
+
+        let (person_hash, person_bytes): (u64, &[u8]) = match resolved_links.get(uid_bytes) {
+            Some(root) => (root.0, &root.1),
+            None => (fnv1a(uid_bytes), uid_bytes),
+        };
+
+        valid_clicks.push(FastClick {
+            person_hash,
+            person: person_bytes,
+            cid: best_cid,
+            ts: best_c.ts,
+            camp_id,
+        });
     }
 
-    for clicks in valid_clicks_by_person.values_mut() {
-        clicks.sort_by_key(|c| c.0);
-    }
+    valid_clicks.par_sort_unstable_by(|a, b| {
+        a.person_hash
+            .cmp(&b.person_hash)
+            .then_with(|| a.person.cmp(b.person))
+            .then_with(|| a.ts.cmp(&b.ts))
+            .then_with(|| a.cid.cmp(b.cid))
+    });
 
-    // 7. SESSIONIZE & ATTRIBUTE
+    // 7. PARALLEL SESSIONIZE & ATTRIBUTE
     const THIRTY_MIN_MS: i64 = 1_800_000;
     const SEVEN_DAYS_MS: i64 = 7 * 86400 * 1000;
 
-    struct UserDailyEntry {
+    struct UserDailyRecord<'a> {
+        person: &'a [u8],
+        day: i32,
         sessions: i64,
         events: i64,
         revenue: i64,
-        cat_rev: HashMap<Arc<str>, i64>,
+        top_category: Option<u8>,
     }
 
+    #[derive(Clone, Copy)]
     struct CampaignDailyEntry {
         sessions: i64,
         purchasing_sessions: i64,
@@ -647,148 +819,258 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assisted_sessions: i64,
     }
 
-    let mut user_daily_map: HashMap<(Arc<[u8]>, i32), UserDailyEntry> = HashMap::with_capacity(200_000);
-    let mut campaign_daily_map: HashMap<(Arc<str>, i32), CampaignDailyEntry> = HashMap::with_capacity(100_000);
-    let organic_str: Arc<str> = "organic".into();
+    struct PersonDayAgg {
+        sessions: i64,
+        events: i64,
+        revenue: i64,
+        cat_rev: [i64; 32],
+    }
 
-    let mut event_idx = 0;
-    while event_idx < valid_events.len() {
-        let person = valid_events[event_idx].person.clone();
-        let mut person_end = event_idx + 1;
-        while person_end < valid_events.len() && valid_events[person_end].person == person {
-            person_end += 1;
+    let n_threads = rayon::current_num_threads();
+    let chunk_size = (valid_events.len() + n_threads - 1) / n_threads;
+    let mut split_indices = Vec::with_capacity(n_threads + 1);
+    split_indices.push(0);
+
+    for i in 1..n_threads {
+        let mut split = (i * chunk_size).min(valid_events.len());
+        while split < valid_events.len()
+            && (valid_events[split].person_hash == valid_events[split - 1].person_hash
+                && valid_events[split].person == valid_events[split - 1].person)
+        {
+            split += 1;
         }
+        split_indices.push(split);
+    }
+    split_indices.push(valid_events.len());
 
-        let p_events = &valid_events[event_idx..person_end];
-        let empty_clicks = Vec::new();
-        let p_clicks = valid_clicks_by_person.get(&person).unwrap_or(&empty_clicks);
+    let clicks_slice = &valid_clicks;
+    let cat_names_ref = &cat_names;
 
-        let mut sess_start_ts = p_events[0].ts;
-        let mut sess_prev_ts = p_events[0].ts;
-        let mut sess_events = 0i64;
-        let mut sess_revenue = 0i64;
-        let mut sess_purchases = 0i64;
-        let mut sess_cat_rev: HashMap<Arc<str>, i64> = HashMap::new();
-
-        let mut process_session = |start_ts: i64, events: i64, revenue: i64, purchases: i64, cat_rev: HashMap<Arc<str>, i64>| {
-            let day_epoch = (start_ts.div_euclid(86_400_000)) as i32;
-
-            // User daily
-            let ud = user_daily_map.entry((person.clone(), day_epoch)).or_insert_with(|| UserDailyEntry {
-                sessions: 0,
-                events: 0,
-                revenue: 0,
-                cat_rev: HashMap::new(),
-            });
-            ud.sessions += 1;
-            ud.events += events;
-            ud.revenue += revenue;
-            for (cat, amt) in cat_rev {
-                *ud.cat_rev.entry(cat).or_insert(0) += amt;
+    let thread_results: Vec<(Vec<UserDailyRecord>, HashMap<(u16, i32), CampaignDailyEntry>)> = (0..n_threads)
+        .into_par_iter()
+        .map(|t_idx| {
+            let start_idx = split_indices[t_idx];
+            let end_idx = split_indices[t_idx + 1];
+            if start_idx >= end_idx {
+                return (Vec::new(), HashMap::new());
             }
 
-            // Click attribution
-            let mut best_click: Option<(i64, &[u8], Arc<str>)> = None;
-            let mut assisting_camps: HashSet<Arc<str>> = HashSet::new();
+            let t_events = &valid_events[start_idx..end_idx];
+            let mut user_records = Vec::with_capacity(t_events.len() / 15);
+            let mut camp_map: HashMap<(u16, i32), CampaignDailyEntry> = HashMap::with_capacity(16384);
 
-            for (c_ts, c_id, c_camp) in p_clicks {
-                if *c_ts > start_ts {
-                    break;
+            let mut p_start = 0;
+            while p_start < t_events.len() {
+                let p_hash = t_events[p_start].person_hash;
+                let p_name = t_events[p_start].person;
+
+                let mut p_end = p_start + 1;
+                while p_end < t_events.len()
+                    && t_events[p_end].person_hash == p_hash
+                    && t_events[p_end].person == p_name
+                {
+                    p_end += 1;
                 }
-                if (start_ts - *c_ts) <= SEVEN_DAYS_MS {
-                    assisting_camps.insert(c_camp.clone());
-                    if let Some(best) = &mut best_click {
-                        if *c_ts > best.0 {
-                            *best = (*c_ts, c_id.as_slice(), c_camp.clone());
-                        } else if *c_ts == best.0 && c_id.as_slice() < best.1 {
-                            *best = (*c_ts, c_id.as_slice(), c_camp.clone());
+
+                let person_events = &t_events[p_start..p_end];
+                p_start = p_end;
+
+                let c_start = clicks_slice.partition_point(|c| (c.person_hash, c.person) < (p_hash, p_name));
+                let c_end = clicks_slice.partition_point(|c| (c.person_hash, c.person) <= (p_hash, p_name));
+                let person_clicks = &clicks_slice[c_start..c_end];
+
+                let mut person_daily: HashMap<i32, PersonDayAgg> = HashMap::with_capacity(16);
+
+                let mut sess_start_ts = person_events[0].ts;
+                let mut sess_prev_ts = person_events[0].ts;
+                let mut sess_events = 0i64;
+                let mut sess_revenue = 0i64;
+                let mut sess_purchases = 0i64;
+                let mut sess_cat_rev = [0i64; 32];
+
+                let process_session = |s_start_ts: i64,
+                                           s_evs: i64,
+                                           s_rev: i64,
+                                           s_purchases: i64,
+                                           s_cat_rev: [i64; 32],
+                                           p_daily: &mut HashMap<i32, PersonDayAgg>,
+                                           c_map: &mut HashMap<(u16, i32), CampaignDailyEntry>| {
+                    let day_epoch = (s_start_ts.div_euclid(86_400_000)) as i32;
+
+                    let pd = p_daily.entry(day_epoch).or_insert_with(|| PersonDayAgg {
+                        sessions: 0,
+                        events: 0,
+                        revenue: 0,
+                        cat_rev: [0; 32],
+                    });
+                    pd.sessions += 1;
+                    pd.events += s_evs;
+                    pd.revenue += s_rev;
+                    for i in 0..32 {
+                        pd.cat_rev[i] += s_cat_rev[i];
+                    }
+
+                    let mut best_click: Option<(i64, &[u8], u16)> = None;
+                    let mut assisting_camps = [false; 1024];
+                    let mut has_assisted = false;
+
+                    for c in person_clicks {
+                        if c.ts > s_start_ts {
+                            break;
                         }
-                    } else {
-                        best_click = Some((*c_ts, c_id.as_slice(), c_camp.clone()));
+                        if (s_start_ts - c.ts) <= SEVEN_DAYS_MS {
+                            if (c.camp_id as usize) < assisting_camps.len() {
+                                assisting_camps[c.camp_id as usize] = true;
+                                has_assisted = true;
+                            }
+                            if let Some(best) = &mut best_click {
+                                if c.ts > best.0 {
+                                    *best = (c.ts, c.cid, c.camp_id);
+                                } else if c.ts == best.0 && c.cid < best.1 {
+                                    *best = (c.ts, c.cid, c.camp_id);
+                                }
+                            } else {
+                                best_click = Some((c.ts, c.cid, c.camp_id));
+                            }
+                        }
+                    }
+
+                    let credited_camp_id = best_click.map(|b| b.2).unwrap_or(ORGANIC_CAMP_ID);
+                    let cd = c_map.entry((credited_camp_id, day_epoch)).or_insert_with(|| CampaignDailyEntry {
+                        sessions: 0,
+                        purchasing_sessions: 0,
+                        revenue: 0,
+                        assisted_sessions: 0,
+                    });
+                    cd.sessions += 1;
+                    if s_purchases > 0 {
+                        cd.purchasing_sessions += 1;
+                    }
+                    cd.revenue += s_rev;
+
+                    if has_assisted {
+                        for camp_id in 1..assisting_camps.len() {
+                            if assisting_camps[camp_id] {
+                                let ac = c_map.entry((camp_id as u16, day_epoch)).or_insert_with(|| CampaignDailyEntry {
+                                    sessions: 0,
+                                    purchasing_sessions: 0,
+                                    revenue: 0,
+                                    assisted_sessions: 0,
+                                });
+                                ac.assisted_sessions += 1;
+                            }
+                        }
+                    }
+                };
+
+                for ev in person_events {
+                    if (ev.ts - sess_prev_ts) > THIRTY_MIN_MS {
+                        process_session(
+                            sess_start_ts,
+                            sess_events,
+                            sess_revenue,
+                            sess_purchases,
+                            sess_cat_rev,
+                            &mut person_daily,
+                            &mut camp_map,
+                        );
+                        sess_start_ts = ev.ts;
+                        sess_events = 0;
+                        sess_revenue = 0;
+                        sess_purchases = 0;
+                        sess_cat_rev = [0; 32];
+                    }
+                    sess_prev_ts = ev.ts;
+                    sess_events += 1;
+                    if ev.etype == 3 {
+                        sess_purchases += 1;
+                        sess_revenue += ev.price_cents as i64;
+                        sess_cat_rev[ev.category as usize] += ev.price_cents as i64;
                     }
                 }
-            }
+                process_session(
+                    sess_start_ts,
+                    sess_events,
+                    sess_revenue,
+                    sess_purchases,
+                    sess_cat_rev,
+                    &mut person_daily,
+                    &mut camp_map,
+                );
 
-            let credited_camp = best_click.map(|b| b.2).unwrap_or_else(|| organic_str.clone());
-            let cd = campaign_daily_map.entry((credited_camp, day_epoch)).or_insert_with(|| CampaignDailyEntry {
+                for (day_epoch, pd) in person_daily {
+                    let mut best_cat_idx: Option<usize> = None;
+                    for i in 0..32 {
+                        let amt = pd.cat_rev[i];
+                        if amt > 0 {
+                            if let Some(b) = best_cat_idx {
+                                if amt > pd.cat_rev[b] {
+                                    best_cat_idx = Some(i);
+                                } else if amt == pd.cat_rev[b] {
+                                    if cat_names_ref[i] < cat_names_ref[b] {
+                                        best_cat_idx = Some(i);
+                                    }
+                                }
+                            } else {
+                                best_cat_idx = Some(i);
+                            }
+                        }
+                    }
+                    user_records.push(UserDailyRecord {
+                        person: p_name,
+                        day: day_epoch,
+                        sessions: pd.sessions,
+                        events: pd.events,
+                        revenue: pd.revenue,
+                        top_category: best_cat_idx.map(|idx| idx as u8),
+                    });
+                }
+            }
+            (user_records, camp_map)
+        })
+        .collect();
+
+    // 8. PARQUET OUTPUT GENERATION
+    let u_dir = Path::new(&output_dir).join("user_daily");
+    fs::create_dir_all(&u_dir)?;
+    let c_dir = Path::new(&output_dir).join("campaign_daily");
+    fs::create_dir_all(&c_dir)?;
+
+    let total_user_rows: usize = thread_results.iter().map(|(ur, _)| ur.len()).sum();
+    let mut u_ids: Vec<String> = Vec::with_capacity(total_user_rows);
+    let mut u_days: Vec<i32> = Vec::with_capacity(total_user_rows);
+    let mut u_sessions: Vec<i64> = Vec::with_capacity(total_user_rows);
+    let mut u_events: Vec<i64> = Vec::with_capacity(total_user_rows);
+    let mut u_rev: Vec<i64> = Vec::with_capacity(total_user_rows);
+    let mut u_top_cat: Vec<Option<String>> = Vec::with_capacity(total_user_rows);
+
+    let mut merged_campaign_daily: HashMap<(u16, i32), CampaignDailyEntry> = HashMap::with_capacity(32768);
+
+    for (ur, cm) in thread_results {
+        for r in ur {
+            u_ids.push(String::from_utf8_lossy(r.person).to_string());
+            u_days.push(r.day);
+            u_sessions.push(r.sessions);
+            u_events.push(r.events);
+            u_rev.push(r.revenue);
+            u_top_cat.push(r.top_category.map(|idx| cat_names[idx as usize].clone()));
+        }
+        for (k, v) in cm {
+            let entry = merged_campaign_daily.entry(k).or_insert_with(|| CampaignDailyEntry {
                 sessions: 0,
                 purchasing_sessions: 0,
                 revenue: 0,
                 assisted_sessions: 0,
             });
-            cd.sessions += 1;
-            if purchases > 0 {
-                cd.purchasing_sessions += 1;
-            }
-            cd.revenue += revenue;
-
-            for a_camp in assisting_camps {
-                let ac = campaign_daily_map.entry((a_camp, day_epoch)).or_insert_with(|| CampaignDailyEntry {
-                    sessions: 0,
-                    purchasing_sessions: 0,
-                    revenue: 0,
-                    assisted_sessions: 0,
-                });
-                ac.assisted_sessions += 1;
-            }
-        };
-
-        for ev in p_events {
-            if ev.ts - sess_prev_ts > THIRTY_MIN_MS {
-                process_session(sess_start_ts, sess_events, sess_revenue, sess_purchases, sess_cat_rev);
-                sess_start_ts = ev.ts;
-                sess_events = 0;
-                sess_revenue = 0;
-                sess_purchases = 0;
-                sess_cat_rev = HashMap::new();
-            }
-            sess_prev_ts = ev.ts;
-            sess_events += 1;
-            if ev.etype == 3 {
-                sess_purchases += 1;
-                sess_revenue += ev.price_cents as i64;
-                *sess_cat_rev.entry(ev.category.clone()).or_insert(0) += ev.price_cents as i64;
-            }
+            entry.sessions += v.sessions;
+            entry.purchasing_sessions += v.purchasing_sessions;
+            entry.revenue += v.revenue;
+            entry.assisted_sessions += v.assisted_sessions;
         }
-        process_session(sess_start_ts, sess_events, sess_revenue, sess_purchases, sess_cat_rev);
-
-        event_idx = person_end;
     }
 
-    // 8. WRITE OUTPUT PARQUET TABLES
-    let ud_dir = Path::new(&out_dir).join("user_daily");
-    let cd_dir = Path::new(&out_dir).join("campaign_daily");
-    fs::create_dir_all(&ud_dir)?;
-    fs::create_dir_all(&cd_dir)?;
-
-    // Table 1: user_daily
-    let mut u_ids: Vec<String> = Vec::with_capacity(user_daily_map.len());
-    let mut u_days: Vec<i32> = Vec::with_capacity(user_daily_map.len());
-    let mut u_sessions: Vec<i64> = Vec::with_capacity(user_daily_map.len());
-    let mut u_events: Vec<i64> = Vec::with_capacity(user_daily_map.len());
-    let mut u_rev: Vec<i64> = Vec::with_capacity(user_daily_map.len());
-    let mut u_top_cat: Vec<Option<String>> = Vec::with_capacity(user_daily_map.len());
-
-    for ((person, day_epoch), data) in user_daily_map {
-        let person_str = String::from_utf8_lossy(&person).to_string();
-        u_ids.push(person_str);
-        u_days.push(day_epoch);
-        u_sessions.push(data.sessions);
-        u_events.push(data.events);
-        u_rev.push(data.revenue);
-
-        // Find top category
-        let top = if data.cat_rev.is_empty() {
-            None
-        } else {
-            let mut pairs: Vec<(&Arc<str>, &i64)> = data.cat_rev.iter().collect();
-            pairs.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-            Some(pairs[0].0.to_string())
-        };
-        u_top_cat.push(top);
-    }
-
-    let ud_schema = Arc::new(Schema::new(vec![
+    // Write user_daily.parquet
+    let u_schema = Arc::new(Schema::new(vec![
         Field::new("user_id", DataType::Utf8, false),
         Field::new("day", DataType::Date32, false),
         Field::new("sessions", DataType::Int64, false),
@@ -797,45 +1079,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Field::new("top_category", DataType::Utf8, true),
     ]));
 
-    let ud_batch = RecordBatch::try_new(
-        ud_schema.clone(),
+    let u_batch = RecordBatch::try_new(
+        u_schema.clone(),
         vec![
-            Arc::new(StringArray::from_iter_values(u_ids.iter().map(|s| s.as_str()))) as ArrayRef,
+            Arc::new(StringArray::from(u_ids)) as ArrayRef,
             Arc::new(Date32Array::from(u_days)) as ArrayRef,
             Arc::new(Int64Array::from(u_sessions)) as ArrayRef,
             Arc::new(Int64Array::from(u_events)) as ArrayRef,
             Arc::new(Int64Array::from(u_rev)) as ArrayRef,
-            Arc::new(StringArray::from_iter(u_top_cat.iter().map(|opt| opt.as_deref()))) as ArrayRef,
+            Arc::new(StringArray::from(u_top_cat)) as ArrayRef,
         ],
     )?;
 
-    let props = WriterProperties::builder()
-        .set_compression(Compression::UNCOMPRESSED)
-        .build();
+    let u_file = File::create(u_dir.join("part-0.parquet"))?;
+    let props = WriterProperties::builder().build();
+    let mut u_writer = ArrowWriter::try_new(u_file, u_schema, Some(props))?;
+    u_writer.write(&u_batch)?;
+    u_writer.close()?;
 
-    let ud_file = File::create(ud_dir.join("part-0.parquet"))?;
-    let mut ud_writer = ArrowWriter::try_new(ud_file, ud_schema, Some(props.clone()))?;
-    ud_writer.write(&ud_batch)?;
-    ud_writer.close()?;
+    // Write campaign_daily.parquet
+    let mut c_ids: Vec<String> = Vec::with_capacity(merged_campaign_daily.len());
+    let mut c_channels: Vec<String> = Vec::with_capacity(merged_campaign_daily.len());
+    let mut c_days: Vec<i32> = Vec::with_capacity(merged_campaign_daily.len());
+    let mut c_sessions: Vec<i64> = Vec::with_capacity(merged_campaign_daily.len());
+    let mut c_purchasing: Vec<i64> = Vec::with_capacity(merged_campaign_daily.len());
+    let mut c_rev: Vec<i64> = Vec::with_capacity(merged_campaign_daily.len());
+    let mut c_assisted: Vec<i64> = Vec::with_capacity(merged_campaign_daily.len());
 
-    // Table 2: campaign_daily
-    let mut c_ids: Vec<String> = Vec::with_capacity(campaign_daily_map.len());
-    let mut c_channels: Vec<String> = Vec::with_capacity(campaign_daily_map.len());
-    let mut c_days: Vec<i32> = Vec::with_capacity(campaign_daily_map.len());
-    let mut c_sessions: Vec<i64> = Vec::with_capacity(campaign_daily_map.len());
-    let mut c_purchasing: Vec<i64> = Vec::with_capacity(campaign_daily_map.len());
-    let mut c_rev: Vec<i64> = Vec::with_capacity(campaign_daily_map.len());
-    let mut c_assisted: Vec<i64> = Vec::with_capacity(campaign_daily_map.len());
-
-    for ((camp_id, day_epoch), data) in campaign_daily_map {
-        let channel = if camp_id.as_ref() == "organic" {
-            organic_str.clone()
-        } else {
-            campaigns.get(camp_id.as_bytes()).cloned().unwrap_or_else(|| "".into())
-        };
-
-        c_ids.push(camp_id.to_string());
-        c_channels.push(channel.to_string());
+    for ((camp_id, day_epoch), data) in merged_campaign_daily {
+        let (cid_str, ch_str) = &campaign_names[camp_id as usize];
+        c_ids.push(cid_str.clone());
+        c_channels.push(ch_str.clone());
         c_days.push(day_epoch);
         c_sessions.push(data.sessions);
         c_purchasing.push(data.purchasing_sessions);
@@ -843,7 +1117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         c_assisted.push(data.assisted_sessions);
     }
 
-    let cd_schema = Arc::new(Schema::new(vec![
+    let c_schema = Arc::new(Schema::new(vec![
         Field::new("campaign_id", DataType::Utf8, false),
         Field::new("channel", DataType::Utf8, false),
         Field::new("day", DataType::Date32, false),
@@ -853,11 +1127,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Field::new("assisted_sessions", DataType::Int64, false),
     ]));
 
-    let cd_batch = RecordBatch::try_new(
-        cd_schema.clone(),
+    let c_batch = RecordBatch::try_new(
+        c_schema.clone(),
         vec![
-            Arc::new(StringArray::from_iter_values(c_ids.iter().map(|s| s.as_str()))) as ArrayRef,
-            Arc::new(StringArray::from_iter_values(c_channels.iter().map(|s| s.as_str()))) as ArrayRef,
+            Arc::new(StringArray::from(c_ids)) as ArrayRef,
+            Arc::new(StringArray::from(c_channels)) as ArrayRef,
             Arc::new(Date32Array::from(c_days)) as ArrayRef,
             Arc::new(Int64Array::from(c_sessions)) as ArrayRef,
             Arc::new(Int64Array::from(c_purchasing)) as ArrayRef,
@@ -866,10 +1140,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ],
     )?;
 
-    let cd_file = File::create(cd_dir.join("part-0.parquet"))?;
-    let mut cd_writer = ArrowWriter::try_new(cd_file, cd_schema, Some(props))?;
-    cd_writer.write(&cd_batch)?;
-    cd_writer.close()?;
+    let c_file = File::create(c_dir.join("part-0.parquet"))?;
+    let props = WriterProperties::builder().build();
+    let mut c_writer = ArrowWriter::try_new(c_file, c_schema, Some(props))?;
+    c_writer.write(&c_batch)?;
+    c_writer.close()?;
 
     Ok(())
 }
