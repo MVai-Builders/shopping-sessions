@@ -1,13 +1,16 @@
-FROM rust:1.85-bookworm AS builder
-WORKDIR /app
-COPY Cargo.toml Cargo.lock* ./
-COPY src ./src
-ENV RUSTFLAGS="-C target-cpu=haswell -C opt-level=3 -C codegen-units=1"
-RUN cargo build --release
+FROM python:3.12-slim-bookworm
 
-FROM debian:bookworm-slim
+RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+COPY pipeline/ /app/pipeline/
+COPY run.sh /app/run.sh
+RUN chmod +x /app/run.sh
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 WORKDIR /app
-COPY --from=builder /app/target/release/shopping-sessions /app/shopping-sessions
-RUN chmod +x /app/shopping-sessions
-USER 1000
-ENTRYPOINT ["/app/shopping-sessions"]
+CMD ["/app/run.sh"]
