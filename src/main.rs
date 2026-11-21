@@ -1,5 +1,6 @@
 use std::env;
 use std::fs::{self, File};
+use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -14,7 +15,23 @@ use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
 use serde::Deserialize;
 
-// ─── Fast Date & Integer Parsing ─────────────────────────────────────────────
+// ─── Fast Date & Civil Math ──────────────────────────────────────────────────
+
+#[inline(always)]
+fn is_leap(y: i64) -> bool {
+    y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
+}
+
+#[inline(always)]
+fn days_from_civil(mut y: i64, m: i64, d: i64) -> i32 {
+    if m <= 2 {
+        y -= 1;
+    }
+    let era = y.div_euclid(400);
+    let y_oe = y.rem_euclid(400);
+    let d_oy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    (era * 146097 + y_oe * 365 + y_oe / 4 - y_oe / 100 + d_oy - 719468) as i32
+}
 
 #[inline(always)]
 fn parse_2_digits(s: &[u8]) -> Option<i64> {
@@ -40,16 +57,6 @@ fn parse_4_digits(s: &[u8]) -> Option<i64> {
             + (s[2] - b'0') as i64 * 10
             + (s[3] - b'0') as i64,
     )
-}
-
-fn days_from_civil(mut y: i64, m: i64, d: i64) -> i32 {
-    if m <= 2 {
-        y -= 1;
-    }
-    let era = y.div_euclid(400);
-    let y_oe = y.rem_euclid(400);
-    let d_oy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
-    (era * 146097 + y_oe * 365 + y_oe / 4 - y_oe / 100 + d_oy - 719468) as i32
 }
 
 #[inline(always)]
@@ -82,23 +89,8 @@ fn parse_iso_f1(s: &[u8]) -> Option<i64> {
     {
         return None;
     }
-    let is_leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let dims = [
-        0,
-        31,
-        if is_leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    if !(1..=dims[m as usize]).contains(&d) {
+    let dim = [0, 31, if is_leap(y) { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if !(1..=dim[m as usize]).contains(&d) {
         return None;
     }
     let ed = days_from_civil(y, m, d) as i64;
@@ -121,9 +113,7 @@ fn parse_iso_f2(s: &[u8]) -> Option<i64> {
     if sign != b'+' && sign != b'-' {
         return None;
     }
-    for &idx in &[
-        0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 23, 24,
-    ] {
+    for &idx in &[0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 23, 24] {
         if !s[idx].is_ascii_digit() {
             return None;
         }
@@ -146,23 +136,8 @@ fn parse_iso_f2(s: &[u8]) -> Option<i64> {
     if !(0..=23).contains(&oh) || !(0..=59).contains(&omi) {
         return None;
     }
-    let is_leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let dims = [
-        0,
-        31,
-        if is_leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    if !(1..=dims[m as usize]).contains(&d) {
+    let dim = [0, 31, if is_leap(y) { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if !(1..=dim[m as usize]).contains(&d) {
         return None;
     }
     let ed = days_from_civil(y, m, d) as i64;
@@ -187,35 +162,30 @@ fn parse_timestamp(s: &[u8]) -> Option<i64> {
     if s.len() == 25 && (s[19] == b'+' || s[19] == b'-') {
         return parse_iso_f2(s);
     }
-    if s.iter().all(|b| b.is_ascii_digit()) {
-        std::str::from_utf8(s).ok()?.parse::<i64>().ok()
-    } else {
-        None
+    if s.iter().all(|&b| b.is_ascii_digit()) {
+        let mut val = 0i64;
+        for &b in s {
+            val = val.checked_mul(10)?.checked_add((b - b'0') as i64)?;
+        }
+        return Some(val);
     }
+    None
 }
 
-// ─── CSV Field Unquoting ─────────────────────────────────────────────────────
+// ─── Fast Zero-Copy CSV Dialect ──────────────────────────────────────────────
 
 #[inline(always)]
-fn unquote_field(slice: &[u8]) -> Option<&[u8]> {
-    if slice.is_empty() {
-        return Some(slice);
+fn unquote_field(mut s: &[u8]) -> Option<&[u8]> {
+    if s.starts_with(b"\"") {
+        if s.len() < 2 || !s.ends_with(b"\"") {
+            return None;
+        }
+        s = &s[1..s.len() - 1];
     }
-    if slice[0] == b'"' {
-        if slice.len() < 2 || slice[slice.len() - 1] != b'"' {
-            return None;
-        }
-        let inner = &slice[1..slice.len() - 1];
-        if inner.iter().any(|&b| b == b'"') {
-            return None;
-        }
-        Some(inner)
-    } else {
-        if slice.iter().any(|&b| b == b'"') {
-            return None;
-        }
-        Some(slice)
+    if s.contains(&b'\"') {
+        return None;
     }
+    Some(s)
 }
 
 #[inline(always)]
@@ -224,88 +194,120 @@ fn parse_line<'a>(line: &'a [u8], expected_cols: usize, out: &mut Vec<&'a [u8]>)
     let mut start = 0;
     for (i, &b) in line.iter().enumerate() {
         if b == b',' {
-            if let Some(field) = unquote_field(&line[start..i]) {
-                out.push(field);
-            } else {
-                return false;
+            let field = unquote_field(&line[start..i]);
+            match field {
+                Some(f) => out.push(f),
+                None => return false,
             }
             start = i + 1;
         }
     }
-    if let Some(field) = unquote_field(&line[start..]) {
-        out.push(field);
-    } else {
-        return false;
+    let field = unquote_field(&line[start..]);
+    match field {
+        Some(f) => out.push(f),
+        None => return false,
     }
     out.len() == expected_cols
 }
 
-// ─── Disjoint Set Union (DSU) ────────────────────────────────────────────────
+// ─── String Interner & DSU ───────────────────────────────────────────────────
 
-#[derive(Default)]
-struct Dsu {
-    parent: HashMap<Vec<u8>, Vec<u8>>,
+struct Interner {
+    map: HashMap<Vec<u8>, u32>,
+    strings: Vec<Vec<u8>>,
 }
 
-impl Dsu {
-    fn find(&mut self, x: &[u8]) -> Vec<u8> {
-        if let Some(p) = self.parent.get(x) {
-            if p.as_slice() == x {
-                return p.clone();
-            }
-            let p_clone = p.clone();
-            let root = self.find(&p_clone);
-            self.parent.insert(x.to_vec(), root.clone());
-            root
-        } else {
-            x.to_vec()
+impl Interner {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            map: HashMap::with_capacity(cap),
+            strings: Vec::with_capacity(cap),
         }
     }
 
-    fn union(&mut self, a: &[u8], b: &[u8]) {
+    fn intern(&mut self, s: &[u8]) -> u32 {
+        if let Some(&id) = self.map.get(s) {
+            id
+        } else {
+            let id = self.strings.len() as u32;
+            let v = s.to_vec();
+            self.map.insert(v.clone(), id);
+            self.strings.push(v);
+            id
+        }
+    }
+
+    fn get_id(&self, s: &[u8]) -> Option<u32> {
+        self.map.get(s).copied()
+    }
+
+    fn resolve(&self, id: u32) -> &[u8] {
+        &self.strings[id as usize]
+    }
+}
+
+struct FastDsu {
+    parent: Vec<u32>,
+}
+
+impl FastDsu {
+    fn new(size: usize) -> Self {
+        Self {
+            parent: (0..size as u32).collect(),
+        }
+    }
+
+    fn ensure_capacity(&mut self, size: usize) {
+        while self.parent.len() < size {
+            self.parent.push(self.parent.len() as u32);
+        }
+    }
+
+    fn find(&mut self, mut x: u32) -> u32 {
+        let mut root = x;
+        while self.parent[root as usize] != root {
+            root = self.parent[root as usize];
+        }
+        while x != root {
+            let next = self.parent[x as usize];
+            self.parent[x as usize] = root;
+            x = next;
+        }
+        root
+    }
+
+    fn union(&mut self, a: u32, b: u32, interner: &Interner) {
         let ra = self.find(a);
         let rb = self.find(b);
         if ra != rb {
-            if ra < rb {
-                self.parent.insert(rb, ra);
+            let sa = interner.resolve(ra);
+            let sb = interner.resolve(rb);
+            if sa < sb {
+                self.parent[rb as usize] = ra;
             } else {
-                self.parent.insert(ra, rb);
+                self.parent[ra as usize] = rb;
             }
         }
     }
 }
 
-// ─── Main Pipeline ────────────────────────────────────────────────────────────
+// ─── Event Struct ────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+struct CompactEvent {
+    person: u32,
+    ts: i64,
+    price_cents: u32,
+    etype: u8,
+    category: u8,
+}
+
+// ─── Main Pipeline ───────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct Manifest {
     window_start: String,
     window_end: String,
-}
-
-struct RawEvent {
-    ingest_ms: i64,
-    uid: Vec<u8>,
-    ts_str: Vec<u8>,
-    etype: Vec<u8>,
-    pid: Vec<u8>,
-    price_str: Vec<u8>,
-}
-
-struct ValidEvent {
-    person: Vec<u8>,
-    ts: i64,
-    etype: u8,
-    category: Arc<str>,
-    price_cents: i64,
-}
-
-struct Session {
-    start_ts: i64,
-    events: i64,
-    revenue: i64,
-    purchases: i64,
-    cat_rev: HashMap<Arc<str>, i64>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -318,8 +320,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let w_end = parse_iso_f1(manifest.window_end.as_bytes()).expect("bad window_end");
     let click_w_start = w_start - 7 * 86400 * 1000;
 
-    // 1. Products: product_id -> category
-    let mut products: HashMap<Vec<u8>, Arc<str>> = HashMap::new();
+    // 1. Categories & Products
+    let mut cat_interner = Interner::with_capacity(32);
+    let unknown_cat_id = cat_interner.intern(b"unknown") as u8;
+
+    let mut products: HashMap<Vec<u8>, u8> = HashMap::with_capacity(65536);
     let p_path = Path::new(&data_dir).join("products.csv");
     if p_path.exists() {
         let content = fs::read(&p_path)?;
@@ -329,14 +334,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             if parse_line(line, 2, &mut cols) && !cols[0].is_empty() {
-                let cat_str: Arc<str> = String::from_utf8_lossy(cols[1]).into();
-                products.insert(cols[0].to_vec(), cat_str);
+                let cat_id = cat_interner.intern(cols[1]) as u8;
+                products.insert(cols[0].to_vec(), cat_id);
             }
         }
     }
 
-    // 2. Campaigns: campaign_id -> channel
-    let mut campaigns: HashMap<Vec<u8>, Arc<str>> = HashMap::new();
+    // 2. Campaigns
+    let mut campaign_interner = Interner::with_capacity(4096);
+    let mut campaigns: HashMap<u16, (Vec<u8>, Vec<u8>)> = HashMap::with_capacity(4096);
     let c_path = Path::new(&data_dir).join("campaigns.csv");
     if c_path.exists() {
         let content = fs::read(&c_path)?;
@@ -346,14 +352,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             if parse_line(line, 2, &mut cols) && !cols[0].is_empty() {
-                let ch_str: Arc<str> = String::from_utf8_lossy(cols[1]).into();
-                campaigns.insert(cols[0].to_vec(), ch_str);
+                let camp_id = campaign_interner.intern(cols[0]) as u16;
+                campaigns.insert(camp_id, (cols[0].to_vec(), cols[1].to_vec()));
             }
         }
     }
 
-    // 3. Links & DSU
-    let mut dsu = Dsu::default();
+    // 3. User IDs & Links DSU
+    let mut user_interner = Interner::with_capacity(2_000_000);
+    let mut dsu = FastDsu::new(2_000_000);
+
     let links_pattern = format!("{}/links/*.csv", data_dir);
     let mut link_files: Vec<PathBuf> = glob::glob(&links_pattern)?
         .filter_map(Result::ok)
@@ -368,207 +376,172 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             if parse_line(line, 2, &mut cols) && !cols[0].is_empty() && !cols[1].is_empty() {
-                dsu.union(cols[0], cols[1]);
+                let ua = user_interner.intern(cols[0]);
+                let ub = user_interner.intern(cols[1]);
+                let max_id = ua.max(ub) as usize + 1;
+                dsu.ensure_capacity(max_id);
+                dsu.union(ua, ub, &user_interner);
             }
         }
     }
 
-    // 4. Events: PARALLEL PARSE ACROSS ALL 8 CORES
+    // 4. Events: PARALLEL SHARDED PARSING & DEDUP
     let events_pattern = format!("{}/events/*.csv", data_dir);
     let mut event_files: Vec<PathBuf> = glob::glob(&events_pattern)?
         .filter_map(Result::ok)
         .collect();
     event_files.sort();
 
-    // Parse each event file in parallel, collecting per-thread maps
-    let per_file_events: Vec<HashMap<Vec<u8>, RawEvent>> = event_files
-        .par_iter()
-        .map(|ef| {
-            let mut file_events: HashMap<Vec<u8>, RawEvent> = HashMap::new();
-            if let Ok(file) = File::open(ef) {
-                if let Ok(mmap) = unsafe { Mmap::map(&file) } {
-                    let mut cols = Vec::with_capacity(7);
-                    for line in mmap.split(|&b| b == b'\n').skip(1) {
-                        if line.is_empty() {
-                            continue;
-                        }
-                        if !parse_line(line, 7, &mut cols) {
-                            continue;
-                        }
-                        let eid = cols[0];
-                        if eid.is_empty() {
-                            continue;
-                        }
-                        let Some(ingest_ms) = parse_iso_f1(cols[3]) else {
-                            continue;
-                        };
+    const NUM_SHARDS: usize = 64;
 
-                        if let Some(existing) = file_events.get_mut(eid) {
-                            if ingest_ms < existing.ingest_ms {
-                                existing.ingest_ms = ingest_ms;
-                                existing.uid = cols[1].to_vec();
-                                existing.ts_str = cols[2].to_vec();
-                                existing.etype = cols[4].to_vec();
-                                existing.pid = cols[5].to_vec();
-                                existing.price_str = cols[6].to_vec();
+    // Per-shard event record for deduplication
+    struct RawEventEntry {
+        ingest_ms: i64,
+        uid: Vec<u8>,
+        ts_str: Vec<u8>,
+        etype: u8,
+        pid: Vec<u8>,
+        price_cents: u32,
+    }
+
+    let shard_results: Vec<Vec<RawEventEntry>> = (0..NUM_SHARDS)
+        .into_par_iter()
+        .map(|shard_idx| {
+            let mut shard_events: HashMap<Vec<u8>, (i64, Vec<u8>, Vec<u8>, u8, Vec<u8>, u32)> =
+                HashMap::with_capacity(65536);
+
+            for ef in &event_files {
+                if let Ok(file) = File::open(ef) {
+                    if let Ok(mmap) = unsafe { Mmap::map(&file) } {
+                        let mut cols = Vec::with_capacity(7);
+                        for line in mmap.split(|&b| b == b'\n').skip(1) {
+                            if line.is_empty() {
+                                continue;
                             }
-                        } else {
-                            file_events.insert(
-                                eid.to_vec(),
-                                RawEvent {
-                                    ingest_ms,
-                                    uid: cols[1].to_vec(),
-                                    ts_str: cols[2].to_vec(),
-                                    etype: cols[4].to_vec(),
-                                    pid: cols[5].to_vec(),
-                                    price_str: cols[6].to_vec(),
-                                },
-                            );
+                            if !parse_line(line, 7, &mut cols) {
+                                continue;
+                            }
+                            let eid = cols[0];
+                            if eid.is_empty() {
+                                continue;
+                            }
+
+                            // Shard filter by fast hash
+                            let hash = hashbrown::DefaultHashBuilder::default()
+                                .hash_one(eid) as usize;
+                            if (hash % NUM_SHARDS) != shard_idx {
+                                continue;
+                            }
+
+                            let Some(ingest_ms) = parse_iso_f1(cols[3]) else {
+                                continue;
+                            };
+
+                            let etype = match cols[4] {
+                                b"view" => 1u8,
+                                b"cart" => 2u8,
+                                b"purchase" => 3u8,
+                                _ => 0u8,
+                            };
+
+                            let mut price_cents = 0u32;
+                            if etype == 3 {
+                                if !cols[6].is_empty()
+                                    && cols[6].iter().all(|b| b.is_ascii_digit())
+                                {
+                                    if let Ok(p) = std::str::from_utf8(cols[6])
+                                        .unwrap()
+                                        .parse::<u32>()
+                                    {
+                                        if (1..=10_000_000).contains(&p) {
+                                            price_cents = p;
+                                        }
+                                    }
+                                }
+                            }
+
+                            if let Some(existing) = shard_events.get_mut(eid) {
+                                if ingest_ms < existing.0 {
+                                    *existing = (
+                                        ingest_ms,
+                                        cols[1].to_vec(),
+                                        cols[2].to_vec(),
+                                        etype,
+                                        cols[5].to_vec(),
+                                        price_cents,
+                                    );
+                                }
+                            } else {
+                                shard_events.insert(
+                                    eid.to_vec(),
+                                    (
+                                        ingest_ms,
+                                        cols[1].to_vec(),
+                                        cols[2].to_vec(),
+                                        etype,
+                                        cols[5].to_vec(),
+                                        price_cents,
+                                    ),
+                                );
+                            }
                         }
                     }
                 }
             }
-            file_events
+
+            shard_events
+                .into_iter()
+                .map(|(_eid, (ingest_ms, uid, ts_str, etype, pid, price_cents))| RawEventEntry {
+                    ingest_ms,
+                    uid,
+                    ts_str,
+                    etype,
+                    pid,
+                    price_cents,
+                })
+                .collect()
         })
         .collect();
 
-    // Fast reduction of per-file maps into single deduplicated map
-    let mut kept_events: HashMap<Vec<u8>, RawEvent> = HashMap::new();
-    for file_map in per_file_events {
-        for (eid, ev) in file_map {
-            if let Some(existing) = kept_events.get_mut(&eid) {
-                if ev.ingest_ms < existing.ingest_ms {
-                    *existing = ev;
-                }
-            } else {
-                kept_events.insert(eid, ev);
-            }
-        }
-    }
+    // Flatten shard events and validate
+    let mut valid_events: Vec<CompactEvent> = Vec::with_capacity(shard_results.iter().map(|s| s.len()).sum());
 
-    // Validate kept events
-    let unknown_cat: Arc<str> = "unknown".into();
-    let mut valid_events: Vec<ValidEvent> = Vec::with_capacity(kept_events.len());
-
-    for (_eid, ev) in kept_events {
-        if ev.uid.is_empty() || ev.pid.is_empty() {
-            continue;
-        }
-        let etype = match ev.etype.as_slice() {
-            b"view" => 1,
-            b"cart" => 2,
-            b"purchase" => 3,
-            _ => continue,
-        };
-        let Some(ts) = parse_timestamp(&ev.ts_str) else {
-            continue;
-        };
-        if ts < w_start || ts >= w_end {
-            continue;
-        }
-        if (ev.ingest_ms - ts) > 86400 * 1000 {
-            continue;
-        }
-
-        let mut price = 0i64;
-        if etype == 3 {
-            if ev.price_str.is_empty() || !ev.price_str.iter().all(|b| b.is_ascii_digit()) {
+    for shard in shard_results {
+        for ev in shard {
+            if ev.uid.is_empty() || ev.pid.is_empty() || ev.etype == 0 {
                 continue;
             }
-            let Ok(p) = std::str::from_utf8(&ev.price_str).unwrap().parse::<i64>() else {
+            if ev.etype == 3 && ev.price_cents == 0 {
+                continue;
+            }
+            let Some(ts) = parse_timestamp(&ev.ts_str) else {
                 continue;
             };
-            if !(1..=10_000_000).contains(&p) {
+            if ts < w_start || ts >= w_end {
                 continue;
             }
-            price = p;
-        }
-
-        let person = dsu.find(&ev.uid);
-        let category = products.get(&ev.pid).cloned().unwrap_or_else(|| unknown_cat.clone());
-
-        valid_events.push(ValidEvent {
-            person,
-            ts,
-            etype,
-            category,
-            price_cents: price,
-        });
-    }
-
-    // 5. PARALLEL RADIX SORT & SESSIONIZE
-    // Sort all valid events by (person, ts) in parallel
-    valid_events.par_sort_unstable_by(|a, b| {
-        a.person.cmp(&b.person).then_with(|| a.ts.cmp(&b.ts))
-    });
-
-    // Group into contiguous person chunks and sessionize
-    let mut person_sessions: HashMap<Vec<u8>, Vec<Session>> = HashMap::new();
-
-    let process_person = |p: Vec<u8>, evs: &[ValidEvent], out_map: &mut HashMap<Vec<u8>, Vec<Session>>| {
-        let mut sessions: Vec<Session> = Vec::new();
-        let mut cur_sess: Option<Session> = None;
-        let mut last_distinct_ts = -1i64;
-
-        for ev in evs {
-            if let Some(ref mut sess) = cur_sess {
-                let gap = ev.ts - last_distinct_ts;
-                if gap > 1_800_000 {
-                    sessions.push(cur_sess.take().unwrap());
-                    last_distinct_ts = ev.ts;
-                    let mut cat_rev = HashMap::new();
-                    if ev.etype == 3 {
-                        cat_rev.insert(ev.category.clone(), ev.price_cents);
-                    }
-                    cur_sess = Some(Session {
-                        start_ts: ev.ts,
-                        events: 1,
-                        revenue: ev.price_cents,
-                        purchases: if ev.etype == 3 { 1 } else { 0 },
-                        cat_rev,
-                    });
-                } else {
-                    sess.events += 1;
-                    if ev.ts > last_distinct_ts {
-                        last_distinct_ts = ev.ts;
-                    }
-                    if ev.etype == 3 {
-                        sess.revenue += ev.price_cents;
-                        sess.purchases += 1;
-                        *sess.cat_rev.entry(ev.category.clone()).or_insert(0) += ev.price_cents;
-                    }
-                }
-            } else {
-                last_distinct_ts = ev.ts;
-                let mut cat_rev = HashMap::new();
-                if ev.etype == 3 {
-                    cat_rev.insert(ev.category.clone(), ev.price_cents);
-                }
-                cur_sess = Some(Session {
-                    start_ts: ev.ts,
-                    events: 1,
-                    revenue: ev.price_cents,
-                    purchases: if ev.etype == 3 { 1 } else { 0 },
-                    cat_rev,
-                });
+            if (ev.ingest_ms - ts) > 86400 * 1000 {
+                continue;
             }
-        }
-        if let Some(sess) = cur_sess {
-            sessions.push(sess);
-        }
-        out_map.insert(p, sessions);
-    };
 
-    let mut start_idx = 0;
-    while start_idx < valid_events.len() {
-        let p = &valid_events[start_idx].person;
-        let mut end_idx = start_idx + 1;
-        while end_idx < valid_events.len() && &valid_events[end_idx].person == p {
-            end_idx += 1;
+            let uid = user_interner.intern(&ev.uid);
+            dsu.ensure_capacity(uid as usize + 1);
+            let person = dsu.find(uid);
+
+            let cat = products.get(&ev.pid).copied().unwrap_or(unknown_cat_id);
+
+            valid_events.push(CompactEvent {
+                person,
+                ts,
+                price_cents: ev.price_cents,
+                etype: ev.etype,
+                category: cat,
+            });
         }
-        process_person(p.clone(), &valid_events[start_idx..end_idx], &mut person_sessions);
-        start_idx = end_idx;
     }
+
+    // 5. PARALLEL SORT EVENTS BY (PERSON, TS)
+    valid_events.par_sort_unstable_by_key(|e| (e.person, e.ts));
 
     // 6. Clicks: PARALLEL PARSE
     let clicks_pattern = format!("{}/clicks/*.csv", data_dir);
@@ -577,7 +550,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     click_files.sort();
 
-    let per_file_clicks: Vec<Vec<(Vec<u8>, i64, Vec<u8>, Vec<u8>)>> = click_files
+    struct RawClick {
+        cid: Vec<u8>,
+        ts: i64,
+        uid: Vec<u8>,
+        camp_id: u16,
+    }
+
+    let per_file_clicks: Vec<Vec<RawClick>> = click_files
         .par_iter()
         .map(|cf| {
             let mut clicks = Vec::new();
@@ -593,13 +573,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         let cid = cols[0];
                         let uid = cols[1];
-                        let camp_id = cols[2];
                         if cid.is_empty() || uid.is_empty() {
                             continue;
                         }
-                        if let Some(ts) = parse_timestamp(cols[3]) {
-                            if ts >= click_w_start && ts < w_end {
-                                clicks.push((cid.to_vec(), ts, uid.to_vec(), camp_id.to_vec()));
+                        if let Some(camp_id) = campaign_interner.get_id(cols[2]) {
+                            if let Some(ts) = parse_timestamp(cols[3]) {
+                                if ts >= click_w_start && ts < w_end {
+                                    clicks.push(RawClick {
+                                        cid: cid.to_vec(),
+                                        ts,
+                                        uid: uid.to_vec(),
+                                        camp_id: camp_id as u16,
+                                    });
+                                }
                             }
                         }
                     }
@@ -609,22 +595,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
-    let mut seen_clicks: HashSet<Vec<u8>> = HashSet::new();
-    let mut valid_clicks_by_person: HashMap<Vec<u8>, Vec<(i64, Vec<u8>, Vec<u8>)>> = HashMap::new();
+    // Deduplicate clicks on click_id
+    let mut seen_clicks: HashSet<Vec<u8>> = HashSet::with_capacity(500_000);
+    let mut valid_clicks_by_person: HashMap<u32, Vec<(i64, Vec<u8>, u16)>> = HashMap::with_capacity(500_000);
 
     for file_clicks in per_file_clicks {
-        for (cid, ts, uid, camp_id) in file_clicks {
-            if !seen_clicks.insert(cid.clone()) {
+        for c in file_clicks {
+            if !seen_clicks.insert(c.cid.clone()) {
                 continue;
             }
-            if !campaigns.contains_key(&camp_id) {
-                continue;
-            }
-            let person = dsu.find(&uid);
+            let uid = user_interner.intern(&c.uid);
+            dsu.ensure_capacity(uid as usize + 1);
+            let person = dsu.find(uid);
+
             valid_clicks_by_person
                 .entry(person)
                 .or_default()
-                .push((ts, cid, camp_id));
+                .push((c.ts, c.cid, c.camp_id));
         }
     }
 
@@ -632,12 +619,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         clicks.sort_by_key(|c| c.0);
     }
 
-    // 7. Attribution & Aggregations
+    // 7. SESSIONIZE & ATTRIBUTE
+    const THIRTY_MIN_MS: i64 = 1_800_000;
+    const SEVEN_DAYS_MS: i64 = 7 * 86400 * 1000;
+
     struct UserDailyEntry {
         sessions: i64,
         events: i64,
         revenue: i64,
-        cat_rev: HashMap<Arc<str>, i64>,
+        cat_rev: [u64; 32],
     }
 
     struct CampaignDailyEntry {
@@ -647,88 +637,116 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assisted_sessions: i64,
     }
 
-    let mut user_daily_map: HashMap<(Vec<u8>, i32), UserDailyEntry> = HashMap::new();
-    let mut campaign_daily_map: HashMap<(Vec<u8>, i32), CampaignDailyEntry> = HashMap::new();
-    let seven_days_ms = 7 * 86400 * 1000;
+    let mut user_daily_map: HashMap<(u32, i32), UserDailyEntry> = HashMap::with_capacity(200_000);
+    let mut campaign_daily_map: HashMap<(Option<u16>, i32), CampaignDailyEntry> = HashMap::with_capacity(100_000);
 
-    for (person, sessions) in person_sessions {
+    let mut event_idx = 0;
+    while event_idx < valid_events.len() {
+        let person = valid_events[event_idx].person;
+        let mut person_end = event_idx + 1;
+        while person_end < valid_events.len() && valid_events[person_end].person == person {
+            person_end += 1;
+        }
+
+        let p_events = &valid_events[event_idx..person_end];
         let empty_clicks = Vec::new();
-        let person_clicks = valid_clicks_by_person.get(&person).unwrap_or(&empty_clicks);
+        let p_clicks = valid_clicks_by_person.get(&person).unwrap_or(&empty_clicks);
 
-        for sess in sessions {
-            let day_epoch = (sess.start_ts.div_euclid(86_400_000)) as i32;
+        let mut sess_start_ts = p_events[0].ts;
+        let mut sess_prev_ts = p_events[0].ts;
+        let mut sess_events = 0i64;
+        let mut sess_revenue = 0i64;
+        let mut sess_purchases = 0i64;
+        let mut sess_cat_rev = [0u64; 32];
+
+        let mut process_session = |start_ts: i64, events: i64, revenue: i64, purchases: i64, cat_rev: [u64; 32]| {
+            let day_epoch = (start_ts.div_euclid(86_400_000)) as i32;
 
             // User daily
-            let ud_key = (person.clone(), day_epoch);
-            let ud_entry = user_daily_map.entry(ud_key).or_insert_with(|| UserDailyEntry {
+            let ud = user_daily_map.entry((person, day_epoch)).or_insert_with(|| UserDailyEntry {
                 sessions: 0,
                 events: 0,
                 revenue: 0,
-                cat_rev: HashMap::new(),
+                cat_rev: [0; 32],
             });
-            ud_entry.sessions += 1;
-            ud_entry.events += sess.events;
-            ud_entry.revenue += sess.revenue;
-            for (cat, amt) in &sess.cat_rev {
-                *ud_entry.cat_rev.entry(cat.clone()).or_insert(0) += amt;
+            ud.sessions += 1;
+            ud.events += events;
+            ud.revenue += revenue;
+            for i in 0..32 {
+                ud.cat_rev[i] += cat_rev[i];
             }
 
             // Click attribution
-            let mut best_click: Option<(i64, &[u8], &[u8])> = None;
-            let mut assisting_camps: HashSet<&[u8]> = HashSet::new();
+            let mut best_click: Option<(i64, &[u8], u16)> = None;
+            let mut assisting_camps: HashSet<u16> = HashSet::new();
 
-            for (c_ts, c_id, c_camp) in person_clicks {
-                if *c_ts > sess.start_ts {
+            for (c_ts, c_id, c_camp) in p_clicks {
+                if *c_ts > start_ts {
                     break;
                 }
-                if (sess.start_ts - *c_ts) <= seven_days_ms {
-                    assisting_camps.insert(c_camp.as_slice());
-                    if let Some((best_ts, best_id, _)) = best_click {
-                        if *c_ts > best_ts || (*c_ts == best_ts && c_id.as_slice() < best_id) {
-                            best_click = Some((*c_ts, c_id.as_slice(), c_camp.as_slice()));
+                if (start_ts - *c_ts) <= SEVEN_DAYS_MS {
+                    assisting_camps.insert(*c_camp);
+                    if let Some(best) = &mut best_click {
+                        if *c_ts > best.0 {
+                            *best = (*c_ts, c_id.as_slice(), *c_camp);
+                        } else if *c_ts == best.0 && c_id.as_slice() < best.1 {
+                            *best = (*c_ts, c_id.as_slice(), *c_camp);
                         }
                     } else {
-                        best_click = Some((*c_ts, c_id.as_slice(), c_camp.as_slice()));
+                        best_click = Some((*c_ts, c_id.as_slice(), *c_camp));
                     }
                 }
             }
 
-            let credited_camp = best_click
-                .map(|(_, _, camp)| camp.to_vec())
-                .unwrap_or_else(|| b"organic".to_vec());
-
-            // Campaign Daily credited row
-            let cd_key = (credited_camp, day_epoch);
-            let cd_entry = campaign_daily_map.entry(cd_key).or_insert_with(|| CampaignDailyEntry {
+            let credited_camp = best_click.map(|b| b.2);
+            let cd = campaign_daily_map.entry((credited_camp, day_epoch)).or_insert_with(|| CampaignDailyEntry {
                 sessions: 0,
                 purchasing_sessions: 0,
                 revenue: 0,
                 assisted_sessions: 0,
             });
-            cd_entry.sessions += 1;
-            if sess.purchases > 0 {
-                cd_entry.purchasing_sessions += 1;
+            cd.sessions += 1;
+            if purchases > 0 {
+                cd.purchasing_sessions += 1;
             }
-            cd_entry.revenue += sess.revenue;
+            cd.revenue += revenue;
 
-            // Campaign Daily assists (organic never assists)
             for a_camp in assisting_camps {
-                let ac_key = (a_camp.to_vec(), day_epoch);
-                let ac_entry = campaign_daily_map.entry(ac_key).or_insert_with(|| CampaignDailyEntry {
+                let ac = campaign_daily_map.entry((Some(a_camp), day_epoch)).or_insert_with(|| CampaignDailyEntry {
                     sessions: 0,
                     purchasing_sessions: 0,
                     revenue: 0,
                     assisted_sessions: 0,
                 });
-                ac_entry.assisted_sessions += 1;
+                ac.assisted_sessions += 1;
+            }
+        };
+
+        for ev in p_events {
+            if ev.ts - sess_prev_ts > THIRTY_MIN_MS {
+                process_session(sess_start_ts, sess_events, sess_revenue, sess_purchases, sess_cat_rev);
+                sess_start_ts = ev.ts;
+                sess_events = 0;
+                sess_revenue = 0;
+                sess_purchases = 0;
+                sess_cat_rev = [0; 32];
+            }
+            sess_prev_ts = ev.ts;
+            sess_events += 1;
+            if ev.etype == 3 {
+                sess_purchases += 1;
+                sess_revenue += ev.price_cents as i64;
+                sess_cat_rev[ev.category as usize] += ev.price_cents as u64;
             }
         }
+        process_session(sess_start_ts, sess_events, sess_revenue, sess_purchases, sess_cat_rev);
+
+        event_idx = person_end;
     }
 
-    // 8. Write Parquet Outputs
-    let out_path = Path::new(&out_dir);
-    let ud_dir = out_path.join("user_daily");
-    let cd_dir = out_path.join("campaign_daily");
+    // 8. WRITE OUTPUT PARQUET TABLES
+    let ud_dir = Path::new(&out_dir).join("user_daily");
+    let cd_dir = Path::new(&out_dir).join("campaign_daily");
     fs::create_dir_all(&ud_dir)?;
     fs::create_dir_all(&cd_dir)?;
 
@@ -740,22 +758,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut u_rev: Vec<i64> = Vec::with_capacity(user_daily_map.len());
     let mut u_top_cat: Vec<Option<String>> = Vec::with_capacity(user_daily_map.len());
 
-    for ((uid, day_epoch), data) in user_daily_map {
-        u_ids.push(String::from_utf8(uid).unwrap_or_default());
+    for ((person, day_epoch), data) in user_daily_map {
+        let person_str = String::from_utf8_lossy(user_interner.resolve(person)).to_string();
+        u_ids.push(person_str);
         u_days.push(day_epoch);
         u_sessions.push(data.sessions);
         u_events.push(data.events);
         u_rev.push(data.revenue);
 
-        let top = if data.cat_rev.is_empty() {
-            None
-        } else {
-            let mut pairs: Vec<(&Arc<str>, &i64)> = data.cat_rev.iter().collect();
-            pairs.sort_by(|a, b| {
-                b.1.cmp(a.1).then_with(|| a.0.cmp(b.0))
-            });
-            Some(pairs[0].0.to_string())
-        };
+        // Find top category
+        let mut best_cat: Option<(u8, u64)> = None;
+        for (cat_idx, &amt) in data.cat_rev.iter().enumerate() {
+            if amt > 0 {
+                let cat_u8 = cat_idx as u8;
+                if let Some(b) = best_cat {
+                    if amt > b.1 {
+                        best_cat = Some((cat_u8, amt));
+                    } else if amt == b.1 {
+                        let sa = cat_interner.resolve(cat_u8 as u32);
+                        let sb = cat_interner.resolve(b.0 as u32);
+                        if sa < sb {
+                            best_cat = Some((cat_u8, amt));
+                        }
+                    }
+                } else {
+                    best_cat = Some((cat_u8, amt));
+                }
+            }
+        }
+        let top = best_cat.map(|b| String::from_utf8_lossy(cat_interner.resolve(b.0 as u32)).to_string());
         u_top_cat.push(top);
     }
 
@@ -798,16 +829,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut c_rev: Vec<i64> = Vec::with_capacity(campaign_daily_map.len());
     let mut c_assisted: Vec<i64> = Vec::with_capacity(campaign_daily_map.len());
 
-    let organic_str: Arc<str> = "organic".into();
-
-    for ((cid, day_epoch), data) in campaign_daily_map {
-        let channel = if cid.as_slice() == b"organic" {
-            organic_str.clone()
-        } else {
-            campaigns.get(&cid).cloned().unwrap_or_else(|| "".into())
+    for ((opt_camp, day_epoch), data) in campaign_daily_map {
+        let (cid_str, channel_str) = match opt_camp {
+            Some(cid) => {
+                let (c, ch) = &campaigns[&cid];
+                (
+                    String::from_utf8_lossy(c).to_string(),
+                    String::from_utf8_lossy(ch).to_string(),
+                )
+            }
+            None => ("organic".to_string(), "organic".to_string()),
         };
-        c_ids.push(String::from_utf8(cid).unwrap_or_default());
-        c_channels.push(channel.to_string());
+
+        c_ids.push(cid_str);
+        c_channels.push(channel_str);
         c_days.push(day_epoch);
         c_sessions.push(data.sessions);
         c_purchasing.push(data.purchasing_sessions);
