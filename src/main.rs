@@ -1,6 +1,5 @@
 use std::env;
 use std::fs::{self, File};
-use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -170,6 +169,18 @@ fn parse_timestamp(s: &[u8]) -> Option<i64> {
         return Some(val);
     }
     None
+}
+
+// ─── Deterministic FNV-1a Hash ───────────────────────────────────────────────
+
+#[inline(always)]
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 // ─── Fast Zero-Copy CSV Dialect ──────────────────────────────────────────────
@@ -385,165 +396,198 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 4. Events: PARALLEL SHARDED PARSING & DEDUP
+    // 4. Events: PARALLEL PARSE & DETERMINISTIC SHARD DEDUP
     let events_pattern = format!("{}/events/*.csv", data_dir);
     let mut event_files: Vec<PathBuf> = glob::glob(&events_pattern)?
         .filter_map(Result::ok)
         .collect();
     event_files.sort();
 
-    const NUM_SHARDS: usize = 64;
+    // Memory map all event files once
+    let mmaps: Vec<Mmap> = event_files
+        .iter()
+        .map(|ef| {
+            let file = File::open(ef).expect("open event file");
+            unsafe { Mmap::map(&file).expect("mmap event file") }
+        })
+        .collect();
 
-    // Per-shard event record for deduplication
-    struct RawEventEntry {
+    #[derive(Clone, Copy)]
+    struct EventLoc {
+        eid_hash: u64,
+        file_idx: u32,
+        line_offset: u32,
+        line_len: u32,
         ingest_ms: i64,
-        uid: Vec<u8>,
-        ts_str: Vec<u8>,
-        etype: u8,
-        pid: Vec<u8>,
-        price_cents: u32,
     }
 
-    let shard_results: Vec<Vec<RawEventEntry>> = (0..NUM_SHARDS)
-        .into_par_iter()
-        .map(|shard_idx| {
-            let mut shard_events: HashMap<Vec<u8>, (i64, Vec<u8>, Vec<u8>, u8, Vec<u8>, u32)> =
-                HashMap::with_capacity(65536);
+    const NUM_SHARDS: usize = 64;
 
-            for ef in &event_files {
-                if let Ok(file) = File::open(ef) {
-                    if let Ok(mmap) = unsafe { Mmap::map(&file) } {
-                        let mut cols = Vec::with_capacity(7);
-                        for line in mmap.split(|&b| b == b'\n').skip(1) {
-                            if line.is_empty() {
-                                continue;
-                            }
-                            if !parse_line(line, 7, &mut cols) {
-                                continue;
-                            }
-                            let eid = cols[0];
-                            if eid.is_empty() {
-                                continue;
-                            }
+    // Phase 4a: Scan files in parallel once, bucketing into shard buffers
+    let per_file_locs: Vec<Vec<EventLoc>> = mmaps
+        .par_iter()
+        .enumerate()
+        .map(|(f_idx, mmap)| {
+            let mut locs = Vec::with_capacity(mmap.len() / 80);
+            let mut cols = Vec::with_capacity(7);
+            let mut start = 0;
+            let bytes = mmap.as_ref();
+            let mut line_num = 0;
 
-                            // Shard filter by fast hash
-                            let hash = hashbrown::DefaultHashBuilder::default()
-                                .hash_one(eid) as usize;
-                            if (hash % NUM_SHARDS) != shard_idx {
-                                continue;
-                            }
+            for (i, &b) in bytes.iter().enumerate() {
+                if b == b'\n' {
+                    let line = &bytes[start..i];
+                    start = i + 1;
+                    line_num += 1;
+                    if line_num == 1 || line.is_empty() {
+                        continue;
+                    }
 
-                            let Some(ingest_ms) = parse_iso_f1(cols[3]) else {
-                                continue;
-                            };
-
-                            let etype = match cols[4] {
-                                b"view" => 1u8,
-                                b"cart" => 2u8,
-                                b"purchase" => 3u8,
-                                _ => 0u8,
-                            };
-
-                            let mut price_cents = 0u32;
-                            if etype == 3 {
-                                if !cols[6].is_empty()
-                                    && cols[6].iter().all(|b| b.is_ascii_digit())
-                                {
-                                    if let Ok(p) = std::str::from_utf8(cols[6])
-                                        .unwrap()
-                                        .parse::<u32>()
-                                    {
-                                        if (1..=10_000_000).contains(&p) {
-                                            price_cents = p;
-                                        }
-                                    }
-                                }
-                            }
-
-                            if let Some(existing) = shard_events.get_mut(eid) {
-                                if ingest_ms < existing.0 {
-                                    *existing = (
-                                        ingest_ms,
-                                        cols[1].to_vec(),
-                                        cols[2].to_vec(),
-                                        etype,
-                                        cols[5].to_vec(),
-                                        price_cents,
-                                    );
-                                }
-                            } else {
-                                shard_events.insert(
-                                    eid.to_vec(),
-                                    (
-                                        ingest_ms,
-                                        cols[1].to_vec(),
-                                        cols[2].to_vec(),
-                                        etype,
-                                        cols[5].to_vec(),
-                                        price_cents,
-                                    ),
-                                );
+                    if parse_line(line, 7, &mut cols) {
+                        let eid = cols[0];
+                        if !eid.is_empty() {
+                            if let Some(ingest_ms) = parse_iso_f1(cols[3]) {
+                                let eid_hash = fnv1a(eid);
+                                locs.push(EventLoc {
+                                    eid_hash,
+                                    file_idx: f_idx as u32,
+                                    line_offset: (line.as_ptr() as usize - bytes.as_ptr() as usize) as u32,
+                                    line_len: line.len() as u32,
+                                    ingest_ms,
+                                });
                             }
                         }
                     }
                 }
             }
-
-            shard_events
-                .into_iter()
-                .map(|(_eid, (ingest_ms, uid, ts_str, etype, pid, price_cents))| RawEventEntry {
-                    ingest_ms,
-                    uid,
-                    ts_str,
-                    etype,
-                    pid,
-                    price_cents,
-                })
-                .collect()
+            // trailing line if no \n
+            if start < bytes.len() {
+                let line = &bytes[start..];
+                if line_num > 0 && !line.is_empty() && parse_line(line, 7, &mut cols) {
+                    let eid = cols[0];
+                    if !eid.is_empty() {
+                        if let Some(ingest_ms) = parse_iso_f1(cols[3]) {
+                            let eid_hash = fnv1a(eid);
+                            locs.push(EventLoc {
+                                eid_hash,
+                                file_idx: f_idx as u32,
+                                line_offset: (line.as_ptr() as usize - bytes.as_ptr() as usize) as u32,
+                                line_len: line.len() as u32,
+                                ingest_ms,
+                            });
+                        }
+                    }
+                }
+            }
+            locs
         })
         .collect();
 
-    // Flatten shard events and validate
-    let mut valid_events: Vec<CompactEvent> = Vec::with_capacity(shard_results.iter().map(|s| s.len()).sum());
+    // Group into 64 shards
+    let mut shard_locs: Vec<Vec<EventLoc>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
+    for file_loc in per_file_locs {
+        for loc in file_loc {
+            let shard = (loc.eid_hash as usize) % NUM_SHARDS;
+            shard_locs[shard].push(loc);
+        }
+    }
 
-    for shard in shard_results {
-        for ev in shard {
-            if ev.uid.is_empty() || ev.pid.is_empty() || ev.etype == 0 {
+    // Phase 4b: Deduplicate each shard in parallel
+    let mmaps_ref = &mmaps;
+    let surviving_locs: Vec<Vec<EventLoc>> = shard_locs
+        .into_par_iter()
+        .map(|locs| {
+            // Deduplicate on eid: map from eid bytes to best EventLoc
+            let mut map: HashMap<&[u8], EventLoc> = HashMap::with_capacity(locs.len());
+            for loc in locs {
+                let bytes = &mmaps_ref[loc.file_idx as usize][loc.line_offset as usize..(loc.line_offset + loc.line_len) as usize];
+                // extract eid
+                let mut cols = Vec::with_capacity(7);
+                if parse_line(bytes, 7, &mut cols) {
+                    let eid = cols[0];
+                    if let Some(existing) = map.get_mut(eid) {
+                        if loc.ingest_ms < existing.ingest_ms {
+                            *existing = loc;
+                        }
+                    } else {
+                        map.insert(eid, loc);
+                    }
+                }
+            }
+            map.into_values().collect()
+        })
+        .collect();
+
+    // Phase 4c: Parse & validate surviving events
+    let mut all_surviving: Vec<EventLoc> = Vec::with_capacity(surviving_locs.iter().map(|s| s.len()).sum());
+    for s in surviving_locs {
+        all_surviving.extend(s);
+    }
+
+    let mut valid_events: Vec<CompactEvent> = Vec::with_capacity(all_surviving.len());
+    let mut cols = Vec::with_capacity(7);
+
+    for loc in all_surviving {
+        let line = &mmaps[loc.file_idx as usize][loc.line_offset as usize..(loc.line_offset + loc.line_len) as usize];
+        if !parse_line(line, 7, &mut cols) {
+            continue;
+        }
+        let uid_bytes = cols[1];
+        let pid_bytes = cols[5];
+        if uid_bytes.is_empty() || pid_bytes.is_empty() {
+            continue;
+        }
+
+        let etype = match cols[4] {
+            b"view" => 1u8,
+            b"cart" => 2u8,
+            b"purchase" => 3u8,
+            _ => continue,
+        };
+
+        let mut price_cents = 0u32;
+        if etype == 3 {
+            if cols[6].is_empty() || !cols[6].iter().all(|b| b.is_ascii_digit()) {
                 continue;
             }
-            if ev.etype == 3 && ev.price_cents == 0 {
-                continue;
-            }
-            let Some(ts) = parse_timestamp(&ev.ts_str) else {
+            let Ok(p) = std::str::from_utf8(cols[6]).unwrap().parse::<u32>() else {
                 continue;
             };
-            if ts < w_start || ts >= w_end {
+            if !(1..=10_000_000).contains(&p) {
                 continue;
             }
-            if (ev.ingest_ms - ts) > 86400 * 1000 {
-                continue;
-            }
-
-            let uid = user_interner.intern(&ev.uid);
-            dsu.ensure_capacity(uid as usize + 1);
-            let person = dsu.find(uid);
-
-            let cat = products.get(&ev.pid).copied().unwrap_or(unknown_cat_id);
-
-            valid_events.push(CompactEvent {
-                person,
-                ts,
-                price_cents: ev.price_cents,
-                etype: ev.etype,
-                category: cat,
-            });
+            price_cents = p;
         }
+
+        let Some(ts) = parse_timestamp(cols[2]) else {
+            continue;
+        };
+        if ts < w_start || ts >= w_end {
+            continue;
+        }
+        if (loc.ingest_ms - ts) > 86400 * 1000 {
+            continue;
+        }
+
+        let uid = user_interner.intern(uid_bytes);
+        dsu.ensure_capacity(uid as usize + 1);
+        let person = dsu.find(uid);
+
+        let cat = products.get(pid_bytes).copied().unwrap_or(unknown_cat_id);
+
+        valid_events.push(CompactEvent {
+            person,
+            ts,
+            price_cents,
+            etype,
+            category: cat,
+        });
     }
 
     // 5. PARALLEL SORT EVENTS BY (PERSON, TS)
     valid_events.par_sort_unstable_by_key(|e| (e.person, e.ts));
 
-    // 6. Clicks: PARALLEL PARSE
+    // 6. Clicks: PARALLEL PARSE & DEDUP
     let clicks_pattern = format!("{}/clicks/*.csv", data_dir);
     let mut click_files: Vec<PathBuf> = glob::glob(&clicks_pattern)?
         .filter_map(Result::ok)
