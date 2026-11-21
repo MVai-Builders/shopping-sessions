@@ -221,82 +221,41 @@ fn parse_line<'a>(line: &'a [u8], expected_cols: usize, out: &mut Vec<&'a [u8]>)
     out.len() == expected_cols
 }
 
-// ─── String Interner & DSU ───────────────────────────────────────────────────
+// ─── DSU for Linked IDs ──────────────────────────────────────────────────────
 
-struct Interner {
-    map: HashMap<Vec<u8>, u32>,
-    strings: Vec<Vec<u8>>,
+struct Dsu {
+    parent: HashMap<Vec<u8>, Vec<u8>>,
 }
 
-impl Interner {
-    fn with_capacity(cap: usize) -> Self {
+impl Dsu {
+    fn new() -> Self {
         Self {
-            map: HashMap::with_capacity(cap),
-            strings: Vec::with_capacity(cap),
+            parent: HashMap::with_capacity(500_000),
         }
     }
 
-    fn intern(&mut self, s: &[u8]) -> u32 {
-        if let Some(&id) = self.map.get(s) {
-            id
+    fn find(&mut self, x: &[u8]) -> Vec<u8> {
+        if let Some(p) = self.parent.get(x) {
+            if p.as_slice() == x {
+                return p.clone();
+            }
+            let p_clone = p.clone();
+            let root = self.find(&p_clone);
+            self.parent.insert(x.to_vec(), root.clone());
+            root
         } else {
-            let id = self.strings.len() as u32;
-            let v = s.to_vec();
-            self.map.insert(v.clone(), id);
-            self.strings.push(v);
-            id
+            x.to_vec()
         }
     }
 
-    fn get_id(&self, s: &[u8]) -> Option<u32> {
-        self.map.get(s).copied()
-    }
-
-    fn resolve(&self, id: u32) -> &[u8] {
-        &self.strings[id as usize]
-    }
-}
-
-struct FastDsu {
-    parent: Vec<u32>,
-}
-
-impl FastDsu {
-    fn new(size: usize) -> Self {
-        Self {
-            parent: (0..size as u32).collect(),
-        }
-    }
-
-    fn ensure_capacity(&mut self, size: usize) {
-        while self.parent.len() < size {
-            self.parent.push(self.parent.len() as u32);
-        }
-    }
-
-    fn find(&mut self, mut x: u32) -> u32 {
-        let mut root = x;
-        while self.parent[root as usize] != root {
-            root = self.parent[root as usize];
-        }
-        while x != root {
-            let next = self.parent[x as usize];
-            self.parent[x as usize] = root;
-            x = next;
-        }
-        root
-    }
-
-    fn union(&mut self, a: u32, b: u32, interner: &Interner) {
+    fn union(&mut self, a: &[u8], b: &[u8]) {
         let ra = self.find(a);
         let rb = self.find(b);
         if ra != rb {
-            let sa = interner.resolve(ra);
-            let sb = interner.resolve(rb);
-            if sa < sb {
-                self.parent[rb as usize] = ra;
+            if ra < rb {
+                self.parent.insert(rb, ra);
             } else {
-                self.parent[ra as usize] = rb;
+                self.parent.insert(ra, rb);
             }
         }
     }
@@ -304,13 +263,13 @@ impl FastDsu {
 
 // ─── Event Struct ────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct CompactEvent {
-    person: u32,
+    person: Arc<[u8]>,
     ts: i64,
     price_cents: u32,
     etype: u8,
-    category: u8,
+    category: Arc<str>,
 }
 
 // ─── Main Pipeline ───────────────────────────────────────────────────────────
@@ -332,10 +291,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let click_w_start = w_start - 7 * 86400 * 1000;
 
     // 1. Categories & Products
-    let mut cat_interner = Interner::with_capacity(32);
-    let unknown_cat_id = cat_interner.intern(b"unknown") as u8;
-
-    let mut products: HashMap<Vec<u8>, u8> = HashMap::with_capacity(65536);
+    let unknown_cat: Arc<str> = "unknown".into();
+    let mut products: HashMap<Vec<u8>, Arc<str>> = HashMap::with_capacity(65536);
     let p_path = Path::new(&data_dir).join("products.csv");
     if p_path.exists() {
         let content = fs::read(&p_path)?;
@@ -345,15 +302,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             if parse_line(line, 2, &mut cols) && !cols[0].is_empty() {
-                let cat_id = cat_interner.intern(cols[1]) as u8;
-                products.insert(cols[0].to_vec(), cat_id);
+                let cat_str: Arc<str> = String::from_utf8_lossy(cols[1]).into();
+                products.insert(cols[0].to_vec(), cat_str);
             }
         }
     }
 
     // 2. Campaigns
-    let mut campaign_interner = Interner::with_capacity(4096);
-    let mut campaigns: HashMap<u16, (Vec<u8>, Vec<u8>)> = HashMap::with_capacity(4096);
+    let mut campaigns: HashMap<Vec<u8>, Arc<str>> = HashMap::with_capacity(4096);
     let c_path = Path::new(&data_dir).join("campaigns.csv");
     if c_path.exists() {
         let content = fs::read(&c_path)?;
@@ -363,16 +319,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             if parse_line(line, 2, &mut cols) && !cols[0].is_empty() {
-                let camp_id = campaign_interner.intern(cols[0]) as u16;
-                campaigns.insert(camp_id, (cols[0].to_vec(), cols[1].to_vec()));
+                let ch_str: Arc<str> = String::from_utf8_lossy(cols[1]).into();
+                campaigns.insert(cols[0].to_vec(), ch_str);
             }
         }
     }
 
     // 3. User IDs & Links DSU
-    let mut user_interner = Interner::with_capacity(2_000_000);
-    let mut dsu = FastDsu::new(2_000_000);
-
+    let mut dsu = Dsu::new();
     let links_pattern = format!("{}/links/*.csv", data_dir);
     let mut link_files: Vec<PathBuf> = glob::glob(&links_pattern)?
         .filter_map(Result::ok)
@@ -387,14 +341,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             if parse_line(line, 2, &mut cols) && !cols[0].is_empty() && !cols[1].is_empty() {
-                let ua = user_interner.intern(cols[0]);
-                let ub = user_interner.intern(cols[1]);
-                let max_id = ua.max(ub) as usize + 1;
-                dsu.ensure_capacity(max_id);
-                dsu.union(ua, ub, &user_interner);
+                dsu.union(cols[0], cols[1]);
             }
         }
     }
+
+    // Pre-resolve DSU into a shared read-only map
+    let mut resolved_links: HashMap<Vec<u8>, Arc<[u8]>> = HashMap::with_capacity(dsu.parent.len());
+    let keys: Vec<Vec<u8>> = dsu.parent.keys().cloned().collect();
+    for k in keys {
+        let root = dsu.find(&k);
+        resolved_links.insert(k, Arc::from(root.into_boxed_slice()));
+    }
+    let resolved_links = Arc::new(resolved_links);
 
     // 4. Events: PARALLEL PARSE & DETERMINISTIC SHARD DEDUP
     let events_pattern = format!("{}/events/*.csv", data_dir);
@@ -403,7 +362,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     event_files.sort();
 
-    // Memory map all event files once
     let mmaps: Vec<Mmap> = event_files
         .iter()
         .map(|ef| {
@@ -414,7 +372,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[derive(Clone, Copy)]
     struct EventLoc {
-        eid_hash: u64,
         file_idx: u32,
         line_offset: u32,
         line_len: u32,
@@ -423,12 +380,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     const NUM_SHARDS: usize = 64;
 
-    // Phase 4a: Scan files in parallel once, bucketing into shard buffers
-    let per_file_locs: Vec<Vec<EventLoc>> = mmaps
+    // Phase 4a: Parse files once in parallel, each producing a 64-shard table
+    let thread_shards: Vec<Vec<Vec<EventLoc>>> = mmaps
         .par_iter()
         .enumerate()
         .map(|(f_idx, mmap)| {
-            let mut locs = Vec::with_capacity(mmap.len() / 80);
+            let mut shards: Vec<Vec<EventLoc>> = (0..NUM_SHARDS)
+                .map(|_| Vec::with_capacity(mmap.len() / (80 * NUM_SHARDS)))
+                .collect();
             let mut cols = Vec::with_capacity(7);
             let mut start = 0;
             let bytes = mmap.as_ref();
@@ -448,8 +407,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if !eid.is_empty() {
                             if let Some(ingest_ms) = parse_iso_f1(cols[3]) {
                                 let eid_hash = fnv1a(eid);
-                                locs.push(EventLoc {
-                                    eid_hash,
+                                let shard = (eid_hash as usize) % NUM_SHARDS;
+                                shards[shard].push(EventLoc {
                                     file_idx: f_idx as u32,
                                     line_offset: (line.as_ptr() as usize - bytes.as_ptr() as usize) as u32,
                                     line_len: line.len() as u32,
@@ -460,7 +419,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            // trailing line if no \n
             if start < bytes.len() {
                 let line = &bytes[start..];
                 if line_num > 0 && !line.is_empty() && parse_line(line, 7, &mut cols) {
@@ -468,8 +426,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if !eid.is_empty() {
                         if let Some(ingest_ms) = parse_iso_f1(cols[3]) {
                             let eid_hash = fnv1a(eid);
-                            locs.push(EventLoc {
-                                eid_hash,
+                            let shard = (eid_hash as usize) % NUM_SHARDS;
+                            shards[shard].push(EventLoc {
                                 file_idx: f_idx as u32,
                                 line_offset: (line.as_ptr() as usize - bytes.as_ptr() as usize) as u32,
                                 line_len: line.len() as u32,
@@ -479,30 +437,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            locs
+            shards
         })
         .collect();
 
-    // Group into 64 shards
-    let mut shard_locs: Vec<Vec<EventLoc>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
-    for file_loc in per_file_locs {
-        for loc in file_loc {
-            let shard = (loc.eid_hash as usize) % NUM_SHARDS;
-            shard_locs[shard].push(loc);
-        }
-    }
-
-    // Phase 4b: Deduplicate each shard in parallel
+    // Phase 4b: Deduplicate & Validate each shard in parallel
     let mmaps_ref = &mmaps;
-    let surviving_locs: Vec<Vec<EventLoc>> = shard_locs
+    let products_ref = &products;
+    let resolved_links_ref = &resolved_links;
+    let unknown_cat_ref = &unknown_cat;
+
+    let shard_valid_events: Vec<Vec<CompactEvent>> = (0..NUM_SHARDS)
         .into_par_iter()
-        .map(|locs| {
-            // Deduplicate on eid: map from eid bytes to best EventLoc
+        .map(|shard_idx| {
+            // Collect all locs for this shard from all threads
+            let total_locs: usize = thread_shards.iter().map(|ts| ts[shard_idx].len()).sum();
+            let mut locs = Vec::with_capacity(total_locs);
+            for ts in &thread_shards {
+                locs.extend_from_slice(&ts[shard_idx]);
+            }
+
+            // Deduplicate on eid: keep lowest ingest_ms
             let mut map: HashMap<&[u8], EventLoc> = HashMap::with_capacity(locs.len());
+            let mut cols = Vec::with_capacity(7);
             for loc in locs {
                 let bytes = &mmaps_ref[loc.file_idx as usize][loc.line_offset as usize..(loc.line_offset + loc.line_len) as usize];
-                // extract eid
-                let mut cols = Vec::with_capacity(7);
                 if parse_line(bytes, 7, &mut cols) {
                     let eid = cols[0];
                     if let Some(existing) = map.get_mut(eid) {
@@ -514,78 +473,84 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            map.into_values().collect()
+
+            // Validate surviving events in this shard
+            let mut valid = Vec::with_capacity(map.len());
+            for loc in map.into_values() {
+                let bytes = &mmaps_ref[loc.file_idx as usize][loc.line_offset as usize..(loc.line_offset + loc.line_len) as usize];
+                if !parse_line(bytes, 7, &mut cols) {
+                    continue;
+                }
+                let uid_bytes = cols[1];
+                let pid_bytes = cols[5];
+                if uid_bytes.is_empty() || pid_bytes.is_empty() {
+                    continue;
+                }
+
+                let etype = match cols[4] {
+                    b"view" => 1u8,
+                    b"cart" => 2u8,
+                    b"purchase" => 3u8,
+                    _ => continue,
+                };
+
+                let mut price_cents = 0u32;
+                if etype == 3 {
+                    if cols[6].is_empty() || !cols[6].iter().all(|b| b.is_ascii_digit()) {
+                        continue;
+                    }
+                    let Ok(p) = std::str::from_utf8(cols[6]).unwrap().parse::<u32>() else {
+                        continue;
+                    };
+                    if !(1..=10_000_000).contains(&p) {
+                        continue;
+                    }
+                    price_cents = p;
+                }
+
+                let Some(ts) = parse_timestamp(cols[2]) else {
+                    continue;
+                };
+                if ts < w_start || ts >= w_end {
+                    continue;
+                }
+                if (loc.ingest_ms - ts) > 86400 * 1000 {
+                    continue;
+                }
+
+                let person: Arc<[u8]> = match resolved_links_ref.get(uid_bytes) {
+                    Some(root) => root.clone(),
+                    None => Arc::from(uid_bytes.to_vec().into_boxed_slice()),
+                };
+
+                let category = match products_ref.get(pid_bytes) {
+                    Some(c) => c.clone(),
+                    None => unknown_cat_ref.clone(),
+                };
+
+                valid.push(CompactEvent {
+                    person,
+                    ts,
+                    price_cents,
+                    etype,
+                    category,
+                });
+            }
+            valid
         })
         .collect();
 
-    // Phase 4c: Parse & validate surviving events
-    let mut all_surviving: Vec<EventLoc> = Vec::with_capacity(surviving_locs.iter().map(|s| s.len()).sum());
-    for s in surviving_locs {
-        all_surviving.extend(s);
-    }
-
-    let mut valid_events: Vec<CompactEvent> = Vec::with_capacity(all_surviving.len());
-    let mut cols = Vec::with_capacity(7);
-
-    for loc in all_surviving {
-        let line = &mmaps[loc.file_idx as usize][loc.line_offset as usize..(loc.line_offset + loc.line_len) as usize];
-        if !parse_line(line, 7, &mut cols) {
-            continue;
-        }
-        let uid_bytes = cols[1];
-        let pid_bytes = cols[5];
-        if uid_bytes.is_empty() || pid_bytes.is_empty() {
-            continue;
-        }
-
-        let etype = match cols[4] {
-            b"view" => 1u8,
-            b"cart" => 2u8,
-            b"purchase" => 3u8,
-            _ => continue,
-        };
-
-        let mut price_cents = 0u32;
-        if etype == 3 {
-            if cols[6].is_empty() || !cols[6].iter().all(|b| b.is_ascii_digit()) {
-                continue;
-            }
-            let Ok(p) = std::str::from_utf8(cols[6]).unwrap().parse::<u32>() else {
-                continue;
-            };
-            if !(1..=10_000_000).contains(&p) {
-                continue;
-            }
-            price_cents = p;
-        }
-
-        let Some(ts) = parse_timestamp(cols[2]) else {
-            continue;
-        };
-        if ts < w_start || ts >= w_end {
-            continue;
-        }
-        if (loc.ingest_ms - ts) > 86400 * 1000 {
-            continue;
-        }
-
-        let uid = user_interner.intern(uid_bytes);
-        dsu.ensure_capacity(uid as usize + 1);
-        let person = dsu.find(uid);
-
-        let cat = products.get(pid_bytes).copied().unwrap_or(unknown_cat_id);
-
-        valid_events.push(CompactEvent {
-            person,
-            ts,
-            price_cents,
-            etype,
-            category: cat,
-        });
+    // Flatten all valid events
+    let total_valid: usize = shard_valid_events.iter().map(|s| s.len()).sum();
+    let mut valid_events: Vec<CompactEvent> = Vec::with_capacity(total_valid);
+    for s in shard_valid_events {
+        valid_events.extend(s);
     }
 
     // 5. PARALLEL SORT EVENTS BY (PERSON, TS)
-    valid_events.par_sort_unstable_by_key(|e| (e.person, e.ts));
+    valid_events.par_sort_unstable_by(|a, b| {
+        a.person.cmp(&b.person).then_with(|| a.ts.cmp(&b.ts))
+    });
 
     // 6. Clicks: PARALLEL PARSE & DEDUP
     let clicks_pattern = format!("{}/clicks/*.csv", data_dir);
@@ -598,7 +563,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cid: Vec<u8>,
         ts: i64,
         uid: Vec<u8>,
-        camp_id: u16,
+        camp_id: Arc<str>,
     }
 
     let per_file_clicks: Vec<Vec<RawClick>> = click_files
@@ -620,14 +585,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if cid.is_empty() || uid.is_empty() {
                             continue;
                         }
-                        if let Some(camp_id) = campaign_interner.get_id(cols[2]) {
+                        if campaigns.contains_key(cols[2]) {
                             if let Some(ts) = parse_timestamp(cols[3]) {
                                 if ts >= click_w_start && ts < w_end {
                                     clicks.push(RawClick {
                                         cid: cid.to_vec(),
                                         ts,
                                         uid: uid.to_vec(),
-                                        camp_id: camp_id as u16,
+                                        camp_id: String::from_utf8_lossy(cols[2]).into(),
                                     });
                                 }
                             }
@@ -641,16 +606,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Deduplicate clicks on click_id
     let mut seen_clicks: HashSet<Vec<u8>> = HashSet::with_capacity(500_000);
-    let mut valid_clicks_by_person: HashMap<u32, Vec<(i64, Vec<u8>, u16)>> = HashMap::with_capacity(500_000);
+    let mut valid_clicks_by_person: HashMap<Arc<[u8]>, Vec<(i64, Vec<u8>, Arc<str>)>> = HashMap::with_capacity(500_000);
 
     for file_clicks in per_file_clicks {
         for c in file_clicks {
             if !seen_clicks.insert(c.cid.clone()) {
                 continue;
             }
-            let uid = user_interner.intern(&c.uid);
-            dsu.ensure_capacity(uid as usize + 1);
-            let person = dsu.find(uid);
+            let person: Arc<[u8]> = match resolved_links.get(&c.uid) {
+                Some(root) => root.clone(),
+                None => Arc::from(c.uid.into_boxed_slice()),
+            };
 
             valid_clicks_by_person
                 .entry(person)
@@ -671,7 +637,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sessions: i64,
         events: i64,
         revenue: i64,
-        cat_rev: [u64; 32],
+        cat_rev: HashMap<Arc<str>, i64>,
     }
 
     struct CampaignDailyEntry {
@@ -681,12 +647,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assisted_sessions: i64,
     }
 
-    let mut user_daily_map: HashMap<(u32, i32), UserDailyEntry> = HashMap::with_capacity(200_000);
-    let mut campaign_daily_map: HashMap<(Option<u16>, i32), CampaignDailyEntry> = HashMap::with_capacity(100_000);
+    let mut user_daily_map: HashMap<(Arc<[u8]>, i32), UserDailyEntry> = HashMap::with_capacity(200_000);
+    let mut campaign_daily_map: HashMap<(Arc<str>, i32), CampaignDailyEntry> = HashMap::with_capacity(100_000);
+    let organic_str: Arc<str> = "organic".into();
 
     let mut event_idx = 0;
     while event_idx < valid_events.len() {
-        let person = valid_events[event_idx].person;
+        let person = valid_events[event_idx].person.clone();
         let mut person_end = event_idx + 1;
         while person_end < valid_events.len() && valid_events[person_end].person == person {
             person_end += 1;
@@ -701,48 +668,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut sess_events = 0i64;
         let mut sess_revenue = 0i64;
         let mut sess_purchases = 0i64;
-        let mut sess_cat_rev = [0u64; 32];
+        let mut sess_cat_rev: HashMap<Arc<str>, i64> = HashMap::new();
 
-        let mut process_session = |start_ts: i64, events: i64, revenue: i64, purchases: i64, cat_rev: [u64; 32]| {
+        let mut process_session = |start_ts: i64, events: i64, revenue: i64, purchases: i64, cat_rev: HashMap<Arc<str>, i64>| {
             let day_epoch = (start_ts.div_euclid(86_400_000)) as i32;
 
             // User daily
-            let ud = user_daily_map.entry((person, day_epoch)).or_insert_with(|| UserDailyEntry {
+            let ud = user_daily_map.entry((person.clone(), day_epoch)).or_insert_with(|| UserDailyEntry {
                 sessions: 0,
                 events: 0,
                 revenue: 0,
-                cat_rev: [0; 32],
+                cat_rev: HashMap::new(),
             });
             ud.sessions += 1;
             ud.events += events;
             ud.revenue += revenue;
-            for i in 0..32 {
-                ud.cat_rev[i] += cat_rev[i];
+            for (cat, amt) in cat_rev {
+                *ud.cat_rev.entry(cat).or_insert(0) += amt;
             }
 
             // Click attribution
-            let mut best_click: Option<(i64, &[u8], u16)> = None;
-            let mut assisting_camps: HashSet<u16> = HashSet::new();
+            let mut best_click: Option<(i64, &[u8], Arc<str>)> = None;
+            let mut assisting_camps: HashSet<Arc<str>> = HashSet::new();
 
             for (c_ts, c_id, c_camp) in p_clicks {
                 if *c_ts > start_ts {
                     break;
                 }
                 if (start_ts - *c_ts) <= SEVEN_DAYS_MS {
-                    assisting_camps.insert(*c_camp);
+                    assisting_camps.insert(c_camp.clone());
                     if let Some(best) = &mut best_click {
                         if *c_ts > best.0 {
-                            *best = (*c_ts, c_id.as_slice(), *c_camp);
+                            *best = (*c_ts, c_id.as_slice(), c_camp.clone());
                         } else if *c_ts == best.0 && c_id.as_slice() < best.1 {
-                            *best = (*c_ts, c_id.as_slice(), *c_camp);
+                            *best = (*c_ts, c_id.as_slice(), c_camp.clone());
                         }
                     } else {
-                        best_click = Some((*c_ts, c_id.as_slice(), *c_camp));
+                        best_click = Some((*c_ts, c_id.as_slice(), c_camp.clone()));
                     }
                 }
             }
 
-            let credited_camp = best_click.map(|b| b.2);
+            let credited_camp = best_click.map(|b| b.2).unwrap_or_else(|| organic_str.clone());
             let cd = campaign_daily_map.entry((credited_camp, day_epoch)).or_insert_with(|| CampaignDailyEntry {
                 sessions: 0,
                 purchasing_sessions: 0,
@@ -756,7 +723,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cd.revenue += revenue;
 
             for a_camp in assisting_camps {
-                let ac = campaign_daily_map.entry((Some(a_camp), day_epoch)).or_insert_with(|| CampaignDailyEntry {
+                let ac = campaign_daily_map.entry((a_camp, day_epoch)).or_insert_with(|| CampaignDailyEntry {
                     sessions: 0,
                     purchasing_sessions: 0,
                     revenue: 0,
@@ -773,14 +740,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sess_events = 0;
                 sess_revenue = 0;
                 sess_purchases = 0;
-                sess_cat_rev = [0; 32];
+                sess_cat_rev = HashMap::new();
             }
             sess_prev_ts = ev.ts;
             sess_events += 1;
             if ev.etype == 3 {
                 sess_purchases += 1;
                 sess_revenue += ev.price_cents as i64;
-                sess_cat_rev[ev.category as usize] += ev.price_cents as u64;
+                *sess_cat_rev.entry(ev.category.clone()).or_insert(0) += ev.price_cents as i64;
             }
         }
         process_session(sess_start_ts, sess_events, sess_revenue, sess_purchases, sess_cat_rev);
@@ -803,7 +770,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut u_top_cat: Vec<Option<String>> = Vec::with_capacity(user_daily_map.len());
 
     for ((person, day_epoch), data) in user_daily_map {
-        let person_str = String::from_utf8_lossy(user_interner.resolve(person)).to_string();
+        let person_str = String::from_utf8_lossy(&person).to_string();
         u_ids.push(person_str);
         u_days.push(day_epoch);
         u_sessions.push(data.sessions);
@@ -811,26 +778,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         u_rev.push(data.revenue);
 
         // Find top category
-        let mut best_cat: Option<(u8, u64)> = None;
-        for (cat_idx, &amt) in data.cat_rev.iter().enumerate() {
-            if amt > 0 {
-                let cat_u8 = cat_idx as u8;
-                if let Some(b) = best_cat {
-                    if amt > b.1 {
-                        best_cat = Some((cat_u8, amt));
-                    } else if amt == b.1 {
-                        let sa = cat_interner.resolve(cat_u8 as u32);
-                        let sb = cat_interner.resolve(b.0 as u32);
-                        if sa < sb {
-                            best_cat = Some((cat_u8, amt));
-                        }
-                    }
-                } else {
-                    best_cat = Some((cat_u8, amt));
-                }
-            }
-        }
-        let top = best_cat.map(|b| String::from_utf8_lossy(cat_interner.resolve(b.0 as u32)).to_string());
+        let top = if data.cat_rev.is_empty() {
+            None
+        } else {
+            let mut pairs: Vec<(&Arc<str>, &i64)> = data.cat_rev.iter().collect();
+            pairs.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+            Some(pairs[0].0.to_string())
+        };
         u_top_cat.push(top);
     }
 
@@ -873,20 +827,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut c_rev: Vec<i64> = Vec::with_capacity(campaign_daily_map.len());
     let mut c_assisted: Vec<i64> = Vec::with_capacity(campaign_daily_map.len());
 
-    for ((opt_camp, day_epoch), data) in campaign_daily_map {
-        let (cid_str, channel_str) = match opt_camp {
-            Some(cid) => {
-                let (c, ch) = &campaigns[&cid];
-                (
-                    String::from_utf8_lossy(c).to_string(),
-                    String::from_utf8_lossy(ch).to_string(),
-                )
-            }
-            None => ("organic".to_string(), "organic".to_string()),
+    for ((camp_id, day_epoch), data) in campaign_daily_map {
+        let channel = if camp_id.as_ref() == "organic" {
+            organic_str.clone()
+        } else {
+            campaigns.get(camp_id.as_bytes()).cloned().unwrap_or_else(|| "".into())
         };
 
-        c_ids.push(cid_str);
-        c_channels.push(channel_str);
+        c_ids.push(camp_id.to_string());
+        c_channels.push(channel.to_string());
         c_days.push(day_epoch);
         c_sessions.push(data.sessions);
         c_purchasing.push(data.purchasing_sessions);
