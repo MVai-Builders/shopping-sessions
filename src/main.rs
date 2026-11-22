@@ -165,12 +165,18 @@ fn parse_timestamp(s: &[u8]) -> Option<i64> {
     None
 }
 
-// ─── Fast Deterministic FNV-1a Hash ──────────────────────────────────────────
+// ─── Fast Word-Level 64-Bit Chunked Hash ──────────────────────────────────────
 
 #[inline(always)]
-fn fnv1a(bytes: &[u8]) -> u64 {
+fn fast_hash(bytes: &[u8]) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
-    for &b in bytes {
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let v = u64::from_le_bytes(chunk.try_into().unwrap());
+        h ^= v;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    for &b in chunks.remainder() {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
@@ -368,14 +374,13 @@ impl Dsu {
 
 #[derive(Clone, Copy)]
 struct RawEvent<'a> {
-    eid_hash: u64,
     ingest_ms: i64,
     eid: &'a [u8],
     uid: &'a [u8],
     ts_bytes: &'a [u8],
-    etype: &'a [u8],
     pid: &'a [u8],
-    price: &'a [u8],
+    price_cents: u32,
+    etype: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -390,7 +395,6 @@ struct FastEvent<'a> {
 
 #[derive(Clone, Copy)]
 struct RawClick<'a> {
-    cid_hash: u64,
     cid: &'a [u8],
     uid: &'a [u8],
     camp_bytes: &'a [u8],
@@ -424,6 +428,7 @@ struct Manifest {
 
 const NUM_EVENT_SHARDS: usize = 64;
 const NUM_PERSON_SHARDS: usize = 64;
+const SHARD_MASK: usize = 63;
 const MAX_CATEGORIES: usize = 64;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -537,7 +542,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let keys: Vec<Vec<u8>> = dsu.parent.keys().cloned().collect();
     for k in keys {
         let root = dsu.find(&k);
-        let h = fnv1a(&root);
+        let h = fast_hash(&root);
         resolved_links.insert(k, (h, Arc::from(root.into_boxed_slice())));
     }
     let resolved_links = Arc::new(resolved_links);
@@ -579,17 +584,42 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let eid = cols[0];
                     if !eid.is_empty() {
                         if let Some(ingest_ms) = parse_iso_f1(cols[3]) {
-                            let eid_hash = fnv1a(eid);
-                            let shard = (eid_hash as usize) % NUM_EVENT_SHARDS;
+                            let mut etype = match cols[4] {
+                                b"view" => 1u8,
+                                b"cart" => 2u8,
+                                b"purchase" => 3u8,
+                                _ => 0u8,
+                            };
+                            let mut price_cents = 0u32;
+                            if etype == 3 {
+                                let pr = cols[6];
+                                if pr.is_empty() || !pr.iter().all(|&b| b.is_ascii_digit()) {
+                                    etype = 0;
+                                } else {
+                                    let mut p = 0u64;
+                                    for &b in pr {
+                                        p = p * 10 + (b - b'0') as u64;
+                                        if p > 10_000_000 {
+                                            break;
+                                        }
+                                    }
+                                    if !(1..=10_000_000).contains(&p) {
+                                        etype = 0;
+                                    } else {
+                                        price_cents = p as u32;
+                                    }
+                                }
+                            }
+                            let eid_hash = fast_hash(eid);
+                            let shard = (eid_hash as usize) & SHARD_MASK;
                             shards[shard].push(RawEvent {
-                                eid_hash,
                                 ingest_ms,
                                 eid,
                                 uid: cols[1],
                                 ts_bytes: cols[2],
-                                etype: cols[4],
                                 pid: cols[5],
-                                price: cols[6],
+                                price_cents,
+                                etype,
                             });
                         }
                     }
@@ -601,17 +631,42 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let eid = cols[0];
                     if !eid.is_empty() {
                         if let Some(ingest_ms) = parse_iso_f1(cols[3]) {
-                            let eid_hash = fnv1a(eid);
-                            let shard = (eid_hash as usize) % NUM_EVENT_SHARDS;
+                            let mut etype = match cols[4] {
+                                b"view" => 1u8,
+                                b"cart" => 2u8,
+                                b"purchase" => 3u8,
+                                _ => 0u8,
+                            };
+                            let mut price_cents = 0u32;
+                            if etype == 3 {
+                                let pr = cols[6];
+                                if pr.is_empty() || !pr.iter().all(|&b| b.is_ascii_digit()) {
+                                    etype = 0;
+                                } else {
+                                    let mut p = 0u64;
+                                    for &b in pr {
+                                        p = p * 10 + (b - b'0') as u64;
+                                        if p > 10_000_000 {
+                                            break;
+                                        }
+                                    }
+                                    if !(1..=10_000_000).contains(&p) {
+                                        etype = 0;
+                                    } else {
+                                        price_cents = p as u32;
+                                    }
+                                }
+                            }
+                            let eid_hash = fast_hash(eid);
+                            let shard = (eid_hash as usize) & SHARD_MASK;
                             shards[shard].push(RawEvent {
-                                eid_hash,
                                 ingest_ms,
                                 eid,
                                 uid: cols[1],
                                 ts_bytes: cols[2],
-                                etype: cols[4],
                                 pid: cols[5],
-                                price: cols[6],
+                                price_cents,
+                                etype,
                             });
                         }
                     }
@@ -628,61 +683,32 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .into_par_iter()
         .map(|shard_idx| {
             let total_items: usize = thread_event_shards.iter().map(|ts| ts[shard_idx].len()).sum();
-            let mut items = Vec::with_capacity(total_items);
+            let mut dedup_map: HashMap<&'a [u8], RawEvent<'a>> = HashMap::with_capacity(total_items);
+
             for ts in &thread_event_shards {
-                items.extend_from_slice(&ts[shard_idx]);
-            }
-
-            items.sort_unstable_by(|a, b| {
-                a.eid_hash
-                    .cmp(&b.eid_hash)
-                    .then_with(|| a.eid.cmp(b.eid))
-                    .then_with(|| a.ingest_ms.cmp(&b.ingest_ms))
-            });
-
-            let mut person_bins: Vec<Vec<FastEvent>> = (0..NUM_PERSON_SHARDS)
-                .map(|_| Vec::with_capacity(items.len() / NUM_PERSON_SHARDS + 32))
-                .collect();
-
-            let mut i = 0;
-            while i < items.len() {
-                let best = &items[i];
-                let mut j = i + 1;
-                while j < items.len() && items[j].eid_hash == best.eid_hash && items[j].eid == best.eid {
-                    j += 1;
-                }
-                i = j;
-
-                let uid = best.uid;
-                let pid = best.pid;
-                if uid.is_empty() || pid.is_empty() {
-                    continue;
-                }
-
-                let etype = match best.etype {
-                    b"view" => 1u8,
-                    b"cart" => 2u8,
-                    b"purchase" => 3u8,
-                    _ => continue,
-                };
-
-                let mut price_cents = 0u32;
-                if etype == 3 {
-                    let pr = best.price;
-                    if pr.is_empty() || !pr.iter().all(|&b| b.is_ascii_digit()) {
-                        continue;
-                    }
-                    let mut p = 0u64;
-                    for &b in pr {
-                        p = p * 10 + (b - b'0') as u64;
-                        if p > 10_000_000 {
-                            break;
+                for ev in &ts[shard_idx] {
+                    match dedup_map.entry(ev.eid) {
+                        hashbrown::hash_map::Entry::Vacant(v) => {
+                            v.insert(*ev);
+                        }
+                        hashbrown::hash_map::Entry::Occupied(mut o) => {
+                            if ev.ingest_ms < o.get().ingest_ms {
+                                o.insert(*ev);
+                            }
                         }
                     }
-                    if !(1..=10_000_000).contains(&p) {
-                        continue;
-                    }
-                    price_cents = p as u32;
+                }
+            }
+
+            let mut person_bins: Vec<Vec<FastEvent>> = (0..NUM_PERSON_SHARDS)
+                .map(|_| Vec::with_capacity(dedup_map.len() / NUM_PERSON_SHARDS + 32))
+                .collect();
+
+            for (_eid, best) in dedup_map {
+                let uid = best.uid;
+                let pid = best.pid;
+                if uid.is_empty() || pid.is_empty() || best.etype == 0 {
+                    continue;
                 }
 
                 let Some(ts) = parse_timestamp(best.ts_bytes) else {
@@ -697,18 +723,18 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                 let (person_hash, person_bytes): (u64, &[u8]) = match resolved_links_ref.get(uid) {
                     Some(root) => (root.0, &root.1),
-                    None => (fnv1a(uid), uid),
+                    None => (fast_hash(uid), uid),
                 };
 
                 let category = *products_ref.get(pid).unwrap_or(&unknown_cat_id);
 
-                let p_shard = (person_hash as usize) % NUM_PERSON_SHARDS;
+                let p_shard = (person_hash as usize) & SHARD_MASK;
                 person_bins[p_shard].push(FastEvent {
                     person_hash,
                     person: person_bytes,
                     ts,
-                    price_cents,
-                    etype,
+                    price_cents: best.price_cents,
+                    etype: best.etype,
                     category,
                 });
             }
@@ -753,10 +779,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 if parse_line_4(line, &mut cols) {
                     let cid = cols[0];
                     if !cid.is_empty() {
-                        let cid_hash = fnv1a(cid);
-                        let shard = (cid_hash as usize) % NUM_EVENT_SHARDS;
+                        let cid_hash = fast_hash(cid);
+                        let shard = (cid_hash as usize) & SHARD_MASK;
                         shards[shard].push(RawClick {
-                            cid_hash,
                             cid,
                             uid: cols[1],
                             camp_bytes: cols[2],
@@ -770,10 +795,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 if line_num > 0 && !line.is_empty() && parse_line_4(line, &mut cols) {
                     let cid = cols[0];
                     if !cid.is_empty() {
-                        let cid_hash = fnv1a(cid);
-                        let shard = (cid_hash as usize) % NUM_EVENT_SHARDS;
+                        let cid_hash = fast_hash(cid);
+                        let shard = (cid_hash as usize) & SHARD_MASK;
                         shards[shard].push(RawClick {
-                            cid_hash,
                             cid,
                             uid: cols[1],
                             camp_bytes: cols[2],
@@ -790,58 +814,46 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .into_par_iter()
         .map(|shard_idx| {
             let total_items: usize = thread_click_shards.iter().map(|ts| ts[shard_idx].len()).sum();
-            let mut items = Vec::with_capacity(total_items);
-            for ts in &thread_click_shards {
-                items.extend_from_slice(&ts[shard_idx]);
-            }
-
-            items.sort_unstable_by(|a, b| {
-                a.cid_hash.cmp(&b.cid_hash).then_with(|| a.cid.cmp(b.cid))
-            });
+            let mut seen: hashbrown::HashSet<&'a [u8]> = hashbrown::HashSet::with_capacity(total_items);
 
             let mut person_bins: Vec<Vec<FastClick>> = (0..NUM_PERSON_SHARDS)
-                .map(|_| Vec::with_capacity(items.len() / NUM_PERSON_SHARDS + 16))
+                .map(|_| Vec::with_capacity(total_items / NUM_PERSON_SHARDS + 16))
                 .collect();
 
-            let mut i = 0;
-            while i < items.len() {
-                let best = &items[i];
-                let mut j = i + 1;
-                while j < items.len() && items[j].cid_hash == best.cid_hash && items[j].cid == best.cid {
-                    j += 1;
+            for ts in &thread_click_shards {
+                for c in &ts[shard_idx] {
+                    if seen.insert(c.cid) {
+                        let uid = c.uid;
+                        if uid.is_empty() {
+                            continue;
+                        }
+
+                        let Some(&camp_id) = campaign_map.get(c.camp_bytes) else {
+                            continue;
+                        };
+
+                        let Some(ts) = parse_timestamp(c.ts_bytes) else {
+                            continue;
+                        };
+                        if ts < click_w_start || ts >= w_end {
+                            continue;
+                        }
+
+                        let (person_hash, person_bytes): (u64, &[u8]) = match resolved_links_ref.get(uid) {
+                            Some(root) => (root.0, &root.1),
+                            None => (fast_hash(uid), uid),
+                        };
+
+                        let p_shard = (person_hash as usize) & SHARD_MASK;
+                        person_bins[p_shard].push(FastClick {
+                            person_hash,
+                            person: person_bytes,
+                            cid: c.cid,
+                            ts,
+                            camp_id,
+                        });
+                    }
                 }
-                i = j;
-
-                let uid = best.uid;
-                let camp_bytes = best.camp_bytes;
-                if uid.is_empty() {
-                    continue;
-                }
-
-                let Some(&camp_id) = campaign_map.get(camp_bytes) else {
-                    continue;
-                };
-
-                let Some(ts) = parse_timestamp(best.ts_bytes) else {
-                    continue;
-                };
-                if ts < click_w_start || ts >= w_end {
-                    continue;
-                }
-
-                let (person_hash, person_bytes): (u64, &[u8]) = match resolved_links_ref.get(uid) {
-                    Some(root) => (root.0, &root.1),
-                    None => (fnv1a(uid), uid),
-                };
-
-                let p_shard = (person_hash as usize) % NUM_PERSON_SHARDS;
-                person_bins[p_shard].push(FastClick {
-                    person_hash,
-                    person: person_bytes,
-                    cid: best.cid,
-                    ts,
-                    camp_id,
-                });
             }
             person_bins
         })
