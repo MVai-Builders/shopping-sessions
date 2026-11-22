@@ -1,5 +1,6 @@
 use std::env;
 use std::fs::{self, File};
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -179,64 +180,45 @@ fn fast_hash(bytes: &[u8]) -> u64 {
     h
 }
 
-// ─── Pass-Through Zero-Cost Hasher for Pre-Hashed Keys ─────────────────────────
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct ShardKey<'a> {
-    hash: u64,
-    bytes: &'a [u8],
-}
-
-impl<'a> std::hash::Hash for ShardKey<'a> {
-    #[inline(always)]
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        state.write_u64(self.hash);
-    }
-}
-
-#[derive(Default)]
-struct PassThroughHasher(u64);
-
-impl std::hash::Hasher for PassThroughHasher {
-    #[inline(always)]
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    #[inline(always)]
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = (self.0 ^ (b as u64)).wrapping_mul(0x100000001b3);
-        }
-    }
-    #[inline(always)]
-    fn write_u64(&mut self, i: u64) {
-        self.0 = i;
-    }
-}
-
-type PassThroughBuildHasher = std::hash::BuildHasherDefault<PassThroughHasher>;
-
-// ─── Fast Zero-Copy CSV Dialect With Single-Pass Quote Tracking ──────────────
+// ─── Fast Zero-Copy CSV Dialect With SIMD Comma Search ────────────────────────
 
 #[inline(always)]
 fn parse_line_7<'a>(line: &'a [u8], cols: &mut [&'a [u8]; 7]) -> bool {
     if memchr::memchr(b'"', line).is_none() {
-        let mut start = 0;
-        let mut col_idx = 0;
-        for (i, &b) in line.iter().enumerate() {
-            if b == b',' {
-                if col_idx >= 6 {
-                    return false;
-                }
-                cols[col_idx] = &line[start..i];
-                col_idx += 1;
-                start = i + 1;
-            }
-        }
-        if col_idx != 6 {
+        let c0 = match memchr::memchr(b',', line) {
+            Some(idx) => idx,
+            None => return false,
+        };
+        let c1 = match memchr::memchr(b',', &line[c0 + 1..]) {
+            Some(idx) => c0 + 1 + idx,
+            None => return false,
+        };
+        let c2 = match memchr::memchr(b',', &line[c1 + 1..]) {
+            Some(idx) => c1 + 1 + idx,
+            None => return false,
+        };
+        let c3 = match memchr::memchr(b',', &line[c2 + 1..]) {
+            Some(idx) => c2 + 1 + idx,
+            None => return false,
+        };
+        let c4 = match memchr::memchr(b',', &line[c3 + 1..]) {
+            Some(idx) => c3 + 1 + idx,
+            None => return false,
+        };
+        let c5 = match memchr::memchr(b',', &line[c4 + 1..]) {
+            Some(idx) => c4 + 1 + idx,
+            None => return false,
+        };
+        if memchr::memchr(b',', &line[c5 + 1..]).is_some() {
             return false;
         }
-        cols[6] = &line[start..];
+        cols[0] = &line[..c0];
+        cols[1] = &line[c0 + 1..c1];
+        cols[2] = &line[c1 + 1..c2];
+        cols[3] = &line[c2 + 1..c3];
+        cols[4] = &line[c3 + 1..c4];
+        cols[5] = &line[c4 + 1..c5];
+        cols[6] = &line[c5 + 1..];
         return true;
     }
 
@@ -287,22 +269,25 @@ fn parse_line_7<'a>(line: &'a [u8], cols: &mut [&'a [u8]; 7]) -> bool {
 #[inline(always)]
 fn parse_line_4<'a>(line: &'a [u8], cols: &mut [&'a [u8]; 4]) -> bool {
     if memchr::memchr(b'"', line).is_none() {
-        let mut start = 0;
-        let mut col_idx = 0;
-        for (i, &b) in line.iter().enumerate() {
-            if b == b',' {
-                if col_idx >= 3 {
-                    return false;
-                }
-                cols[col_idx] = &line[start..i];
-                col_idx += 1;
-                start = i + 1;
-            }
-        }
-        if col_idx != 3 {
+        let c0 = match memchr::memchr(b',', line) {
+            Some(idx) => idx,
+            None => return false,
+        };
+        let c1 = match memchr::memchr(b',', &line[c0 + 1..]) {
+            Some(idx) => c0 + 1 + idx,
+            None => return false,
+        };
+        let c2 = match memchr::memchr(b',', &line[c1 + 1..]) {
+            Some(idx) => c1 + 1 + idx,
+            None => return false,
+        };
+        if memchr::memchr(b',', &line[c2 + 1..]).is_some() {
             return false;
         }
-        cols[3] = &line[start..];
+        cols[0] = &line[..c0];
+        cols[1] = &line[c0 + 1..c1];
+        cols[2] = &line[c1 + 1..c2];
+        cols[3] = &line[c2 + 1..];
         return true;
     }
 
@@ -353,22 +338,15 @@ fn parse_line_4<'a>(line: &'a [u8], cols: &mut [&'a [u8]; 4]) -> bool {
 #[inline(always)]
 fn parse_line_2<'a>(line: &'a [u8], cols: &mut [&'a [u8]; 2]) -> bool {
     if memchr::memchr(b'"', line).is_none() {
-        let mut start = 0;
-        let mut col_idx = 0;
-        for (i, &b) in line.iter().enumerate() {
-            if b == b',' {
-                if col_idx >= 1 {
-                    return false;
-                }
-                cols[col_idx] = &line[start..i];
-                col_idx += 1;
-                start = i + 1;
-            }
-        }
-        if col_idx != 1 {
+        let c0 = match memchr::memchr(b',', line) {
+            Some(idx) => idx,
+            None => return false,
+        };
+        if memchr::memchr(b',', &line[c0 + 1..]).is_some() {
             return false;
         }
-        cols[1] = &line[start..];
+        cols[0] = &line[..c0];
+        cols[1] = &line[c0 + 1..];
         return true;
     }
 
@@ -550,6 +528,8 @@ struct CampaignDailyEntry {
     assisted_sessions: i64,
 }
 
+const MAX_CATEGORIES: usize = 64;
+
 #[derive(Clone, Copy)]
 struct LocalSession {
     start_ts: i64,
@@ -588,8 +568,7 @@ struct Manifest {
 const NUM_EVENT_SHARDS: usize = 64;
 const NUM_PERSON_SHARDS: usize = 64;
 const SHARD_MASK: usize = 63;
-const MAX_CATEGORIES: usize = 64;
-const PARSE_CHUNK_SIZE: usize = 8 * 1024 * 1024; // 8 MB chunks for perfect cache & thread balance
+const PARSE_CHUNK_SIZE: usize = 32 * 1024 * 1024; // 32 MB chunks for optimal cache locality & low allocation count
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Ok(ncpu_str) = env::var("NCPU") {
@@ -686,14 +665,32 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     link_files.sort();
 
     for lf in link_files {
-        let content = fs::read(lf)?;
-        let mut cols = [b"".as_slice(); 2];
-        for line in content.split(|&b| b == b'\n').skip(1) {
-            if line.is_empty() {
-                continue;
+        let file = File::open(lf)?;
+        if file.metadata()?.len() > 0 {
+            let mmap = unsafe { Mmap::map(&file)? };
+            let bytes = mmap.as_ref();
+            let mut cols = [b"".as_slice(); 2];
+            let mut start = 0;
+            let mut is_header = true;
+            for end in memchr::memchr_iter(b'\n', bytes) {
+                let line = &bytes[start..end];
+                start = end + 1;
+                if is_header {
+                    is_header = false;
+                    continue;
+                }
+                if line.is_empty() {
+                    continue;
+                }
+                if parse_line_2(line, &mut cols) && !cols[0].is_empty() && !cols[1].is_empty() {
+                    dsu.union(cols[0], cols[1]);
+                }
             }
-            if parse_line_2(line, &mut cols) && !cols[0].is_empty() && !cols[1].is_empty() {
-                dsu.union(cols[0], cols[1]);
+            if start < bytes.len() {
+                let line = &bytes[start..];
+                if !is_header && !line.is_empty() && parse_line_2(line, &mut cols) && !cols[0].is_empty() && !cols[1].is_empty() {
+                    dsu.union(cols[0], cols[1]);
+                }
             }
         }
     }
@@ -709,7 +706,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     let resolved_links = Arc::new(resolved_links);
 
-    // 4. Events: PARALLEL WORK-STEALING CHUNK SCAN & DEDUP DIRECTLY INTO PERSON BINS
+    // 4. Events: PARALLEL WORK-STEALING SCAN & IN-PLACE L2-RESIDENT SORT DEDUP
     let events_pattern = format!("{}/events/*.csv", data_dir);
     let mut event_files: Vec<PathBuf> = glob::glob(&events_pattern)?
         .filter_map(Result::ok)
@@ -866,32 +863,31 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .into_par_iter()
         .map(|shard_idx| {
             let total_items: usize = thread_event_shards.iter().map(|ts| ts[shard_idx].len()).sum();
-            let mut dedup_map = HashMap::with_capacity_and_hasher(total_items, PassThroughBuildHasher::default());
-
+            let mut items = Vec::with_capacity(total_items);
             for ts in &thread_event_shards {
-                for ev in &ts[shard_idx] {
-                    let key = ShardKey {
-                        hash: ev.eid_hash,
-                        bytes: ev.eid,
-                    };
-                    match dedup_map.entry(key) {
-                        hashbrown::hash_map::Entry::Vacant(v) => {
-                            v.insert(*ev);
-                        }
-                        hashbrown::hash_map::Entry::Occupied(mut o) => {
-                            if ev.ingest_ms < o.get().ingest_ms {
-                                o.insert(*ev);
-                            }
-                        }
-                    }
-                }
+                items.extend_from_slice(&ts[shard_idx]);
             }
 
+            items.sort_unstable_by(|a, b| {
+                a.eid_hash
+                    .cmp(&b.eid_hash)
+                    .then_with(|| a.eid.cmp(b.eid))
+                    .then_with(|| a.ingest_ms.cmp(&b.ingest_ms))
+            });
+
             let mut person_bins = (0..NUM_PERSON_SHARDS)
-                .map(|_| Vec::with_capacity(dedup_map.len() / NUM_PERSON_SHARDS + 32))
+                .map(|_| Vec::with_capacity(items.len() / NUM_PERSON_SHARDS + 32))
                 .collect::<Vec<_>>();
 
-            for (_key, best) in dedup_map {
+            let mut i = 0;
+            while i < items.len() {
+                let best = &items[i];
+                let mut j = i + 1;
+                while j < items.len() && items[j].eid_hash == best.eid_hash && items[j].eid == best.eid {
+                    j += 1;
+                }
+                i = j;
+
                 let uid = best.uid;
                 let pid = best.pid;
                 if uid.is_empty() || pid.is_empty() || best.etype == 0 {
@@ -930,7 +926,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .collect::<Vec<_>>();
     drop(thread_event_shards);
 
-    // 5. Clicks: PARALLEL WORK-STEALING CHUNK SCAN & DEDUP DIRECTLY INTO PERSON BINS
+    // 5. Clicks: PARALLEL WORK-STEALING SCAN & IN-PLACE L2-RESIDENT SORT DEDUP
     let clicks_pattern = format!("{}/clicks/*.csv", data_dir);
     let mut click_files: Vec<PathBuf> = glob::glob(&clicks_pattern)?
         .filter_map(Result::ok)
@@ -1008,57 +1004,66 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .into_par_iter()
         .map(|shard_idx| {
             let total_items: usize = thread_click_shards.iter().map(|ts| ts[shard_idx].len()).sum();
-            let mut seen = hashbrown::HashSet::with_capacity_and_hasher(total_items, PassThroughBuildHasher::default());
+            let mut items = Vec::with_capacity(total_items);
+            for ts in &thread_click_shards {
+                items.extend_from_slice(&ts[shard_idx]);
+            }
+
+            items.sort_unstable_by(|a, b| {
+                a.cid_hash
+                    .cmp(&b.cid_hash)
+                    .then_with(|| a.cid.cmp(b.cid))
+            });
 
             let mut person_bins = (0..NUM_PERSON_SHARDS)
-                .map(|_| Vec::with_capacity(total_items / NUM_PERSON_SHARDS + 16))
+                .map(|_| Vec::with_capacity(items.len() / NUM_PERSON_SHARDS + 16))
                 .collect::<Vec<_>>();
 
-            for ts in &thread_click_shards {
-                for c in &ts[shard_idx] {
-                    let key = ShardKey {
-                        hash: c.cid_hash,
-                        bytes: c.cid,
-                    };
-                    if seen.insert(key) {
-                        let uid = c.uid;
-                        if uid.is_empty() {
-                            continue;
-                        }
-
-                        let Some(&camp_id) = campaign_map.get(c.camp_bytes) else {
-                            continue;
-                        };
-
-                        let Some(ts) = parse_timestamp(c.ts_bytes) else {
-                            continue;
-                        };
-                        if ts < click_w_start || ts >= w_end {
-                            continue;
-                        }
-
-                        let (person_hash, person_bytes): (u64, &[u8]) = match resolved_links_ref.get(uid) {
-                            Some(root) => (root.0, &root.1),
-                            None => (fast_hash(uid), uid),
-                        };
-
-                        let p_shard = (person_hash as usize) & SHARD_MASK;
-                        person_bins[p_shard].push(FastClick {
-                            person_hash,
-                            person: person_bytes,
-                            cid: c.cid,
-                            ts,
-                            camp_id,
-                        });
-                    }
+            let mut i = 0;
+            while i < items.len() {
+                let c = &items[i];
+                let mut j = i + 1;
+                while j < items.len() && items[j].cid_hash == c.cid_hash && items[j].cid == c.cid {
+                    j += 1;
                 }
+                i = j;
+
+                let uid = c.uid;
+                if uid.is_empty() {
+                    continue;
+                }
+
+                let Some(&camp_id) = campaign_map.get(c.camp_bytes) else {
+                    continue;
+                };
+
+                let Some(ts) = parse_timestamp(c.ts_bytes) else {
+                    continue;
+                };
+                if ts < click_w_start || ts >= w_end {
+                    continue;
+                }
+
+                let (person_hash, person_bytes): (u64, &[u8]) = match resolved_links_ref.get(uid) {
+                    Some(root) => (root.0, &root.1),
+                    None => (fast_hash(uid), uid),
+                };
+
+                let p_shard = (person_hash as usize) & SHARD_MASK;
+                person_bins[p_shard].push(FastClick {
+                    person_hash,
+                    person: person_bytes,
+                    cid: c.cid,
+                    ts,
+                    camp_id,
+                });
             }
             person_bins
         })
         .collect::<Vec<_>>();
     drop(thread_click_shards);
 
-    // 6. PARALLEL SESSIONIZE ACROSS ALL PERSON SHARDS WITH ZERO-HASHMAP FLAT ARRAYS
+    // 6. PARALLEL SESSIONIZE ACROSS ALL PERSON SHARDS WITH LINEAR CLICK ADVANCE
     const THIRTY_MIN_MS: i64 = 1_800_000;
     const SEVEN_DAYS_MS: i64 = 7 * 86400 * 1000;
 
@@ -1111,6 +1116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let mut used_days: Vec<usize> = Vec::with_capacity(n_days.min(64));
             let mut sessions: Vec<LocalSession> = Vec::with_capacity(64);
 
+            let mut cur_click_idx = 0;
             let mut p_start = 0;
             while p_start < p_events.len() {
                 let p_hash = p_events[p_start].person_hash;
@@ -1127,9 +1133,20 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let person_events = &p_events[p_start..p_end];
                 p_start = p_end;
 
-                let c_start = clicks_slice.partition_point(|c| (c.person_hash, c.person) < (p_hash, p_name));
-                let c_end = clicks_slice.partition_point(|c| (c.person_hash, c.person) <= (p_hash, p_name));
-                let person_clicks = &clicks_slice[c_start..c_end];
+                // Fast linear two-pointer advance through sorted clicks
+                while cur_click_idx < clicks_slice.len()
+                    && (clicks_slice[cur_click_idx].person_hash, clicks_slice[cur_click_idx].person) < (p_hash, p_name)
+                {
+                    cur_click_idx += 1;
+                }
+                let c_start = cur_click_idx;
+                while cur_click_idx < clicks_slice.len()
+                    && clicks_slice[cur_click_idx].person_hash == p_hash
+                    && clicks_slice[cur_click_idx].person == p_name
+                {
+                    cur_click_idx += 1;
+                }
+                let person_clicks = &clicks_slice[c_start..cur_click_idx];
 
                 for &d_idx in &used_days {
                     person_daily_arr[d_idx] = None;
@@ -1319,8 +1336,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .sum();
 
         if writer_idx == 0 || total_rows > 0 {
-            let mut u_ids_b = StringBuilder::with_capacity(total_rows, total_rows * 12);
-            let mut u_top_cat_b = StringBuilder::with_capacity(total_rows, total_rows * 10);
+            let mut u_ids_b = StringBuilder::with_capacity(total_rows, total_rows * 24);
+            let mut u_top_cat_b = StringBuilder::with_capacity(total_rows, total_rows * 12);
             let mut u_days: Vec<i32> = Vec::with_capacity(total_rows);
             let mut u_sessions: Vec<i64> = Vec::with_capacity(total_rows);
             let mut u_events: Vec<i64> = Vec::with_capacity(total_rows);
@@ -1364,7 +1381,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             ).expect("valid user batch");
 
             let out_file_path = u_dir.join(format!("part-{}.parquet", writer_idx));
-            let u_file = File::create(out_file_path).expect("create user parquet file");
+            let u_file = BufWriter::with_capacity(256 * 1024, File::create(out_file_path).expect("create user parquet file"));
             let props = WriterProperties::builder()
                 .set_compression(parquet::basic::Compression::UNCOMPRESSED)
                 .build();
@@ -1438,7 +1455,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ],
     )?;
 
-    let c_file = File::create(c_dir.join("part-0.parquet"))?;
+    let c_file = BufWriter::with_capacity(64 * 1024, File::create(c_dir.join("part-0.parquet"))?);
     let props = WriterProperties::builder()
         .set_compression(parquet::basic::Compression::UNCOMPRESSED)
         .build();
