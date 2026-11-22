@@ -14,7 +14,7 @@ use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
 use serde::Deserialize;
 
-// ─── Fast Date & Civil Math (Branchless Digits) ──────────────────────────────
+// ─── Fast Date & Civil Math ──────────────────────────────────────────────────
 
 #[inline(always)]
 fn is_leap(y: i64) -> bool {
@@ -177,46 +177,51 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
-// ─── Fast Zero-Copy CSV Dialect ──────────────────────────────────────────────
-
-#[inline(always)]
-fn unquote_field(mut s: &[u8]) -> Option<&[u8]> {
-    if s.starts_with(b"\"") {
-        if s.len() < 2 || !s.ends_with(b"\"") {
-            return None;
-        }
-        s = &s[1..s.len() - 1];
-    }
-    if memchr::memchr(b'"', s).is_some() {
-        return None;
-    }
-    Some(s)
-}
+// ─── Fast Zero-Copy CSV Dialect With Single-Pass Quote Tracking ──────────────
 
 #[inline(always)]
 fn parse_line_7<'a>(line: &'a [u8], cols: &mut [&'a [u8]; 7]) -> bool {
     let mut start = 0;
     let mut col_idx = 0;
+    let mut has_quote = false;
+
     for (i, &b) in line.iter().enumerate() {
         if b == b',' {
             if col_idx >= 6 {
                 return false;
             }
-            let Some(f) = unquote_field(&line[start..i]) else {
-                return false;
-            };
-            cols[col_idx] = f;
+            let mut field = &line[start..i];
+            if has_quote {
+                if !field.starts_with(b"\"") || field.len() < 2 || !field.ends_with(b"\"") {
+                    return false;
+                }
+                field = &field[1..field.len() - 1];
+                if memchr::memchr(b'"', field).is_some() {
+                    return false;
+                }
+            }
+            cols[col_idx] = field;
             col_idx += 1;
             start = i + 1;
+            has_quote = false;
+        } else if b == b'"' {
+            has_quote = true;
         }
     }
     if col_idx != 6 {
         return false;
     }
-    let Some(f) = unquote_field(&line[start..]) else {
-        return false;
-    };
-    cols[6] = f;
+    let mut field = &line[start..];
+    if has_quote {
+        if !field.starts_with(b"\"") || field.len() < 2 || !field.ends_with(b"\"") {
+            return false;
+        }
+        field = &field[1..field.len() - 1];
+        if memchr::memchr(b'"', field).is_some() {
+            return false;
+        }
+    }
+    cols[6] = field;
     true
 }
 
@@ -224,26 +229,45 @@ fn parse_line_7<'a>(line: &'a [u8], cols: &mut [&'a [u8]; 7]) -> bool {
 fn parse_line_4<'a>(line: &'a [u8], cols: &mut [&'a [u8]; 4]) -> bool {
     let mut start = 0;
     let mut col_idx = 0;
+    let mut has_quote = false;
+
     for (i, &b) in line.iter().enumerate() {
         if b == b',' {
             if col_idx >= 3 {
                 return false;
             }
-            let Some(f) = unquote_field(&line[start..i]) else {
-                return false;
-            };
-            cols[col_idx] = f;
+            let mut field = &line[start..i];
+            if has_quote {
+                if !field.starts_with(b"\"") || field.len() < 2 || !field.ends_with(b"\"") {
+                    return false;
+                }
+                field = &field[1..field.len() - 1];
+                if memchr::memchr(b'"', field).is_some() {
+                    return false;
+                }
+            }
+            cols[col_idx] = field;
             col_idx += 1;
             start = i + 1;
+            has_quote = false;
+        } else if b == b'"' {
+            has_quote = true;
         }
     }
     if col_idx != 3 {
         return false;
     }
-    let Some(f) = unquote_field(&line[start..]) else {
-        return false;
-    };
-    cols[3] = f;
+    let mut field = &line[start..];
+    if has_quote {
+        if !field.starts_with(b"\"") || field.len() < 2 || !field.ends_with(b"\"") {
+            return false;
+        }
+        field = &field[1..field.len() - 1];
+        if memchr::memchr(b'"', field).is_some() {
+            return false;
+        }
+    }
+    cols[3] = field;
     true
 }
 
@@ -251,26 +275,45 @@ fn parse_line_4<'a>(line: &'a [u8], cols: &mut [&'a [u8]; 4]) -> bool {
 fn parse_line_2<'a>(line: &'a [u8], cols: &mut [&'a [u8]; 2]) -> bool {
     let mut start = 0;
     let mut col_idx = 0;
+    let mut has_quote = false;
+
     for (i, &b) in line.iter().enumerate() {
         if b == b',' {
             if col_idx >= 1 {
                 return false;
             }
-            let Some(f) = unquote_field(&line[start..i]) else {
-                return false;
-            };
-            cols[col_idx] = f;
+            let mut field = &line[start..i];
+            if has_quote {
+                if !field.starts_with(b"\"") || field.len() < 2 || !field.ends_with(b"\"") {
+                    return false;
+                }
+                field = &field[1..field.len() - 1];
+                if memchr::memchr(b'"', field).is_some() {
+                    return false;
+                }
+            }
+            cols[col_idx] = field;
             col_idx += 1;
             start = i + 1;
+            has_quote = false;
+        } else if b == b'"' {
+            has_quote = true;
         }
     }
     if col_idx != 1 {
         return false;
     }
-    let Some(f) = unquote_field(&line[start..]) else {
-        return false;
-    };
-    cols[1] = f;
+    let mut field = &line[start..];
+    if has_quote {
+        if !field.starts_with(b"\"") || field.len() < 2 || !field.ends_with(b"\"") {
+            return false;
+        }
+        field = &field[1..field.len() - 1];
+        if memchr::memchr(b'"', field).is_some() {
+            return false;
+        }
+    }
+    cols[1] = field;
     true
 }
 
@@ -356,6 +399,14 @@ struct FastClick<'a> {
     camp_id: u32,
 }
 
+#[derive(Clone, Copy, Default)]
+struct CampaignDailyEntry {
+    sessions: i64,
+    purchasing_sessions: i64,
+    revenue: i64,
+    assisted_sessions: i64,
+}
+
 // ─── Main Pipeline ───────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -364,8 +415,8 @@ struct Manifest {
     window_end: String,
 }
 
-const NUM_EVENT_SHARDS: usize = 64;
-const NUM_PERSON_SHARDS: usize = 64;
+const NUM_EVENT_SHARDS: usize = 16;
+const NUM_PERSON_SHARDS: usize = 16;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args: Vec<String> = env::args().collect();
@@ -776,7 +827,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         })
         .collect();
 
-    // 6. PARALLEL SESSIONIZE ACROSS ALL 64 PERSON SHARDS
+    // 6. PARALLEL SESSIONIZE ACROSS ALL PERSON SHARDS WITH ZERO-HASHMAP FLAT ARRAYS
     const THIRTY_MIN_MS: i64 = 1_800_000;
     const SEVEN_DAYS_MS: i64 = 7 * 86400 * 1000;
 
@@ -789,22 +840,15 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         top_category: Option<u8>,
     }
 
-    #[derive(Clone, Copy)]
-    struct CampaignDailyEntry {
-        sessions: i64,
-        purchasing_sessions: i64,
-        revenue: i64,
-        assisted_sessions: i64,
-    }
-
     let cat_names_ref = &cat_names;
+    let total_camp_entries = n_campaigns * n_days;
 
-    let shard_results: Vec<(Vec<UserDailyRecord>, HashMap<(u32, i32), CampaignDailyEntry>)> = (0..NUM_PERSON_SHARDS)
+    let shard_results: Vec<(Vec<UserDailyRecord>, Vec<CampaignDailyEntry>)> = (0..NUM_PERSON_SHARDS)
         .into_par_iter()
         .map(|p_shard| {
             let total_events: usize = event_person_shards.iter().map(|s| s[p_shard].len()).sum();
             if total_events == 0 {
-                return (Vec::new(), HashMap::new());
+                return (Vec::new(), vec![CampaignDailyEntry::default(); total_camp_entries]);
             }
 
             let mut p_events = Vec::with_capacity(total_events);
@@ -835,7 +879,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             let clicks_slice = &p_clicks;
             let mut user_records = Vec::with_capacity(p_events.len() / 10);
-            let mut camp_map: HashMap<(u32, i32), CampaignDailyEntry> = HashMap::with_capacity(2048);
+            let mut camp_daily_arr: Vec<CampaignDailyEntry> = vec![CampaignDailyEntry::default(); total_camp_entries];
 
             let mut assist_seen: Vec<bool> = vec![false; n_campaigns];
             let mut dirty_camps: Vec<u32> = Vec::with_capacity(64);
@@ -933,12 +977,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         }
 
                         let credited_camp_id = best_click.map(|b| b.2).unwrap_or(ORGANIC_CAMP_ID);
-                        let cd = camp_map.entry((credited_camp_id, day_epoch)).or_insert_with(|| CampaignDailyEntry {
-                            sessions: 0,
-                            purchasing_sessions: 0,
-                            revenue: 0,
-                            assisted_sessions: 0,
-                        });
+                        let idx = (credited_camp_id as usize) * n_days + d_idx;
+                        let cd = &mut camp_daily_arr[idx];
                         cd.sessions += 1;
                         if sess_purchases > 0 {
                             cd.purchasing_sessions += 1;
@@ -946,13 +986,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         cd.revenue += sess_revenue;
 
                         for &camp_id in &dirty_camps {
-                            let ac = camp_map.entry((camp_id, day_epoch)).or_insert_with(|| CampaignDailyEntry {
-                                sessions: 0,
-                                purchasing_sessions: 0,
-                                revenue: 0,
-                                assisted_sessions: 0,
-                            });
-                            ac.assisted_sessions += 1;
+                            let aidx = (camp_id as usize) * n_days + d_idx;
+                            camp_daily_arr[aidx].assisted_sessions += 1;
                         }
 
                         for &id in &dirty_camps {
@@ -1008,11 +1043,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     });
                 }
             }
-            (user_records, camp_map)
+            (user_records, camp_daily_arr)
         })
         .collect();
 
-    // 7. PARQUET OUTPUT GENERATION (ZERO-ALLOC STRINGBUILDER + PARALLEL WRITE)
+    // 7. PARQUET OUTPUT GENERATION (PARALLEL WRITE)
     let u_dir = Path::new(&output_dir).join("user_daily");
     fs::create_dir_all(&u_dir)?;
     let c_dir = Path::new(&output_dir).join("campaign_daily");
@@ -1026,7 +1061,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut u_events: Vec<i64> = Vec::with_capacity(total_user_rows);
     let mut u_rev: Vec<i64> = Vec::with_capacity(total_user_rows);
 
-    let mut merged_campaign_daily: HashMap<(u32, i32), CampaignDailyEntry> = HashMap::with_capacity(32768);
+    let mut merged_camp_daily: Vec<CampaignDailyEntry> = vec![CampaignDailyEntry::default(); total_camp_entries];
 
     for (ur, cm) in shard_results {
         for r in ur {
@@ -1042,38 +1077,42 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 u_top_cat_b.append_null();
             }
         }
-        for (k, v) in cm {
-            let entry = merged_campaign_daily.entry(k).or_insert_with(|| CampaignDailyEntry {
-                sessions: 0,
-                purchasing_sessions: 0,
-                revenue: 0,
-                assisted_sessions: 0,
-            });
-            entry.sessions += v.sessions;
-            entry.purchasing_sessions += v.purchasing_sessions;
-            entry.revenue += v.revenue;
-            entry.assisted_sessions += v.assisted_sessions;
+        for i in 0..total_camp_entries {
+            let v = &cm[i];
+            if v.sessions > 0 || v.assisted_sessions > 0 {
+                let m = &mut merged_camp_daily[i];
+                m.sessions += v.sessions;
+                m.purchasing_sessions += v.purchasing_sessions;
+                m.revenue += v.revenue;
+                m.assisted_sessions += v.assisted_sessions;
+            }
         }
     }
 
-    let n_camp_rows = merged_campaign_daily.len();
-    let mut c_ids_b = StringBuilder::with_capacity(n_camp_rows, n_camp_rows * 8);
-    let mut c_channels_b = StringBuilder::with_capacity(n_camp_rows, n_camp_rows * 10);
-    let mut c_days: Vec<i32> = Vec::with_capacity(n_camp_rows);
-    let mut c_sessions: Vec<i64> = Vec::with_capacity(n_camp_rows);
-    let mut c_purchasing: Vec<i64> = Vec::with_capacity(n_camp_rows);
-    let mut c_rev: Vec<i64> = Vec::with_capacity(n_camp_rows);
-    let mut c_assisted: Vec<i64> = Vec::with_capacity(n_camp_rows);
+    let mut c_ids_b = StringBuilder::with_capacity(32768, 32768 * 8);
+    let mut c_channels_b = StringBuilder::with_capacity(32768, 32768 * 10);
+    let mut c_days: Vec<i32> = Vec::with_capacity(32768);
+    let mut c_sessions: Vec<i64> = Vec::with_capacity(32768);
+    let mut c_purchasing: Vec<i64> = Vec::with_capacity(32768);
+    let mut c_rev: Vec<i64> = Vec::with_capacity(32768);
+    let mut c_assisted: Vec<i64> = Vec::with_capacity(32768);
 
-    for ((camp_id, day_epoch), data) in &merged_campaign_daily {
-        let (cid_str, ch_str) = &campaign_names[*camp_id as usize];
-        c_ids_b.append_value(cid_str);
-        c_channels_b.append_value(ch_str);
-        c_days.push(*day_epoch);
-        c_sessions.push(data.sessions);
-        c_purchasing.push(data.purchasing_sessions);
-        c_rev.push(data.revenue);
-        c_assisted.push(data.assisted_sessions);
+    for camp_id in 0..n_campaigns {
+        for d in 0..n_days {
+            let idx = camp_id * n_days + d;
+            let data = &merged_camp_daily[idx];
+            if data.sessions > 0 || data.assisted_sessions > 0 {
+                let (cid_str, ch_str) = &campaign_names[camp_id];
+                let day_epoch = w_start_day + d as i32;
+                c_ids_b.append_value(cid_str);
+                c_channels_b.append_value(ch_str);
+                c_days.push(day_epoch);
+                c_sessions.push(data.sessions);
+                c_purchasing.push(data.purchasing_sessions);
+                c_rev.push(data.revenue);
+                c_assisted.push(data.assisted_sessions);
+            }
+        }
     }
 
     let u_ids_array = Arc::new(u_ids_b.finish()) as ArrayRef;
