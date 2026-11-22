@@ -1190,111 +1190,129 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .collect();
 
     // 7. PARQUET OUTPUT GENERATION (PARALLEL WRITE)
+    let t_parquet_start = std::time::Instant::now();
     let u_dir = Path::new(&output_dir).join("user_daily");
     fs::create_dir_all(&u_dir)?;
     let c_dir = Path::new(&output_dir).join("campaign_daily");
     fs::create_dir_all(&c_dir)?;
 
-    let total_user_rows: usize = shard_results.iter().map(|(ur, _)| ur.len()).sum();
-    let mut u_ids_b = StringBuilder::with_capacity(total_user_rows, total_user_rows * 12);
-    let mut u_top_cat_b = StringBuilder::with_capacity(total_user_rows, total_user_rows * 10);
-    let mut u_days: Vec<i32> = Vec::with_capacity(total_user_rows);
-    let mut u_sessions: Vec<i64> = Vec::with_capacity(total_user_rows);
-    let mut u_events: Vec<i64> = Vec::with_capacity(total_user_rows);
-    let mut u_rev: Vec<i64> = Vec::with_capacity(total_user_rows);
+    let (user_shards, camp_shards): (Vec<Vec<UserDailyRecord>>, Vec<Vec<CampaignDailyEntry>>) =
+        shard_results.into_iter().unzip();
 
-    let mut merged_camp_daily: Vec<CampaignDailyEntry> = vec![CampaignDailyEntry::default(); total_camp_entries];
+    let u_schema = Arc::new(Schema::new(vec![
+        Field::new("user_id", DataType::Utf8, false),
+        Field::new("day", DataType::Date32, false),
+        Field::new("sessions", DataType::Int64, false),
+        Field::new("events", DataType::Int64, false),
+        Field::new("revenue_cents", DataType::Int64, false),
+        Field::new("top_category", DataType::Utf8, true),
+    ]));
 
-    for (ur, cm) in shard_results {
-        for r in ur {
-            let s = unsafe { std::str::from_utf8_unchecked(r.person) };
-            u_ids_b.append_value(s);
-            u_days.push(r.day);
-            u_sessions.push(r.sessions);
-            u_events.push(r.events);
-            u_rev.push(r.revenue);
-            if let Some(idx) = r.top_category {
-                u_top_cat_b.append_value(&cat_names[idx as usize]);
-            } else {
-                u_top_cat_b.append_null();
-            }
-        }
-        for i in 0..total_camp_entries {
-            let v = &cm[i];
-            if v.sessions > 0 || v.assisted_sessions > 0 {
-                let m = &mut merged_camp_daily[i];
-                m.sessions += v.sessions;
-                m.purchasing_sessions += v.purchasing_sessions;
-                m.revenue += v.revenue;
-                m.assisted_sessions += v.assisted_sessions;
-            }
-        }
-    }
+    const NUM_USER_OUTPUT_PARTS: usize = 4;
+    let shards_per_part = (user_shards.len() + NUM_USER_OUTPUT_PARTS - 1) / NUM_USER_OUTPUT_PARTS;
 
-    let mut c_ids_b = StringBuilder::with_capacity(32768, 32768 * 8);
-    let mut c_channels_b = StringBuilder::with_capacity(32768, 32768 * 10);
-    let mut c_days: Vec<i32> = Vec::with_capacity(32768);
-    let mut c_sessions: Vec<i64> = Vec::with_capacity(32768);
-    let mut c_purchasing: Vec<i64> = Vec::with_capacity(32768);
-    let mut c_rev: Vec<i64> = Vec::with_capacity(32768);
-    let mut c_assisted: Vec<i64> = Vec::with_capacity(32768);
-
-    for camp_id in 0..n_campaigns {
-        for d in 0..n_days {
-            let idx = camp_id * n_days + d;
-            let data = &merged_camp_daily[idx];
-            if data.sessions > 0 || data.assisted_sessions > 0 {
-                let (cid_str, ch_str) = &campaign_names[camp_id];
-                let day_epoch = w_start_day + d as i32;
-                c_ids_b.append_value(cid_str);
-                c_channels_b.append_value(ch_str);
-                c_days.push(day_epoch);
-                c_sessions.push(data.sessions);
-                c_purchasing.push(data.purchasing_sessions);
-                c_rev.push(data.revenue);
-                c_assisted.push(data.assisted_sessions);
-            }
-        }
-    }
-
-    let u_ids_array = Arc::new(u_ids_b.finish()) as ArrayRef;
-    let u_top_cat_array = Arc::new(u_top_cat_b.finish()) as ArrayRef;
-    let c_ids_array = Arc::new(c_ids_b.finish()) as ArrayRef;
-    let c_channels_array = Arc::new(c_channels_b.finish()) as ArrayRef;
+    let cat_names_ref = &cat_names;
+    let u_dir_ref = &u_dir;
+    let u_schema_ref = &u_schema;
 
     let write_user_parquet = move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let u_schema = Arc::new(Schema::new(vec![
-            Field::new("user_id", DataType::Utf8, false),
-            Field::new("day", DataType::Date32, false),
-            Field::new("sessions", DataType::Int64, false),
-            Field::new("events", DataType::Int64, false),
-            Field::new("revenue_cents", DataType::Int64, false),
-            Field::new("top_category", DataType::Utf8, true),
-        ]));
+        user_shards
+            .par_chunks(shards_per_part)
+            .enumerate()
+            .try_for_each(|(part_idx, part_shards)| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                let part_rows: usize = part_shards.iter().map(|s| s.len()).sum();
+                if part_rows == 0 {
+                    return Ok(());
+                }
 
-        let u_batch = RecordBatch::try_new(
-            u_schema.clone(),
-            vec![
-                u_ids_array,
-                Arc::new(Date32Array::from(u_days)) as ArrayRef,
-                Arc::new(Int64Array::from(u_sessions)) as ArrayRef,
-                Arc::new(Int64Array::from(u_events)) as ArrayRef,
-                Arc::new(Int64Array::from(u_rev)) as ArrayRef,
-                u_top_cat_array,
-            ],
-        )?;
+                let mut u_ids_b = StringBuilder::with_capacity(part_rows, part_rows * 12);
+                let mut u_top_cat_b = StringBuilder::with_capacity(part_rows, part_rows * 10);
+                let mut u_days: Vec<i32> = Vec::with_capacity(part_rows);
+                let mut u_sessions: Vec<i64> = Vec::with_capacity(part_rows);
+                let mut u_events: Vec<i64> = Vec::with_capacity(part_rows);
+                let mut u_rev: Vec<i64> = Vec::with_capacity(part_rows);
 
-        let u_file = File::create(u_dir.join("part-0.parquet"))?;
-        let props = WriterProperties::builder()
-            .set_compression(parquet::basic::Compression::UNCOMPRESSED)
-            .build();
-        let mut u_writer = ArrowWriter::try_new(u_file, u_schema, Some(props))?;
-        u_writer.write(&u_batch)?;
-        u_writer.close()?;
-        Ok(())
+                for shard in part_shards {
+                    for r in shard {
+                        let s = unsafe { std::str::from_utf8_unchecked(r.person) };
+                        u_ids_b.append_value(s);
+                        u_days.push(r.day);
+                        u_sessions.push(r.sessions);
+                        u_events.push(r.events);
+                        u_rev.push(r.revenue);
+                        if let Some(idx) = r.top_category {
+                            u_top_cat_b.append_value(&cat_names_ref[idx as usize]);
+                        } else {
+                            u_top_cat_b.append_null();
+                        }
+                    }
+                }
+
+                let batch = RecordBatch::try_new(
+                    u_schema_ref.clone(),
+                    vec![
+                        Arc::new(u_ids_b.finish()) as ArrayRef,
+                        Arc::new(Date32Array::from(u_days)) as ArrayRef,
+                        Arc::new(Int64Array::from(u_sessions)) as ArrayRef,
+                        Arc::new(Int64Array::from(u_events)) as ArrayRef,
+                        Arc::new(Int64Array::from(u_rev)) as ArrayRef,
+                        Arc::new(u_top_cat_b.finish()) as ArrayRef,
+                    ],
+                )?;
+
+                let filename = format!("part-{:05}.parquet", part_idx);
+                let file = File::create(u_dir_ref.join(filename))?;
+                let props = WriterProperties::builder()
+                    .set_compression(parquet::basic::Compression::UNCOMPRESSED)
+                    .build();
+                let mut writer = ArrowWriter::try_new(file, u_schema_ref.clone(), Some(props))?;
+                writer.write(&batch)?;
+                writer.close()?;
+                Ok(())
+            })
     };
 
     let write_camp_parquet = move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut merged_camp_daily: Vec<CampaignDailyEntry> = vec![CampaignDailyEntry::default(); total_camp_entries];
+        for cm in camp_shards {
+            for i in 0..total_camp_entries {
+                let v = &cm[i];
+                if v.sessions > 0 || v.assisted_sessions > 0 {
+                    let m = &mut merged_camp_daily[i];
+                    m.sessions += v.sessions;
+                    m.purchasing_sessions += v.purchasing_sessions;
+                    m.revenue += v.revenue;
+                    m.assisted_sessions += v.assisted_sessions;
+                }
+            }
+        }
+
+        let mut c_ids_b = StringBuilder::with_capacity(32768, 32768 * 8);
+        let mut c_channels_b = StringBuilder::with_capacity(32768, 32768 * 10);
+        let mut c_days: Vec<i32> = Vec::with_capacity(32768);
+        let mut c_sessions: Vec<i64> = Vec::with_capacity(32768);
+        let mut c_purchasing: Vec<i64> = Vec::with_capacity(32768);
+        let mut c_rev: Vec<i64> = Vec::with_capacity(32768);
+        let mut c_assisted: Vec<i64> = Vec::with_capacity(32768);
+
+        for camp_id in 0..n_campaigns {
+            for d in 0..n_days {
+                let idx = camp_id * n_days + d;
+                let data = &merged_camp_daily[idx];
+                if data.sessions > 0 || data.assisted_sessions > 0 {
+                    let (cid_str, ch_str) = &campaign_names[camp_id];
+                    let day_epoch = w_start_day + d as i32;
+                    c_ids_b.append_value(cid_str);
+                    c_channels_b.append_value(ch_str);
+                    c_days.push(day_epoch);
+                    c_sessions.push(data.sessions);
+                    c_purchasing.push(data.purchasing_sessions);
+                    c_rev.push(data.revenue);
+                    c_assisted.push(data.assisted_sessions);
+                }
+            }
+        }
+
         let c_schema = Arc::new(Schema::new(vec![
             Field::new("campaign_id", DataType::Utf8, false),
             Field::new("channel", DataType::Utf8, false),
@@ -1308,8 +1326,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let c_batch = RecordBatch::try_new(
             c_schema.clone(),
             vec![
-                c_ids_array,
-                c_channels_array,
+                Arc::new(c_ids_b.finish()) as ArrayRef,
+                Arc::new(c_channels_b.finish()) as ArrayRef,
                 Arc::new(Date32Array::from(c_days)) as ArrayRef,
                 Arc::new(Int64Array::from(c_sessions)) as ArrayRef,
                 Arc::new(Int64Array::from(c_purchasing)) as ArrayRef,
@@ -1318,7 +1336,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             ],
         )?;
 
-        let c_file = File::create(c_dir.join("part-0.parquet"))?;
+        let c_file = File::create(c_dir.join("part-00000.parquet"))?;
         let props = WriterProperties::builder()
             .set_compression(parquet::basic::Compression::UNCOMPRESSED)
             .build();
@@ -1332,6 +1350,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     res_u?;
     res_c?;
 
+    eprintln!("[STAGE] Parquet write time: {:?}", t_parquet_start.elapsed());
     eprintln!("[STAGE] Total runtime: {:?}", start_total.elapsed());
 
     Ok(())
