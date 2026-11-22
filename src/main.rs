@@ -33,42 +33,54 @@ fn days_from_civil(mut y: i64, m: i64, d: i64) -> i32 {
 }
 
 #[inline(always)]
-fn parse_iso_f1(s: &[u8]) -> Option<i64> {
-    if s.len() != 20
-        || s[4] != b'-'
-        || s[7] != b'-'
-        || s[10] != b'T'
-        || s[13] != b':'
-        || s[16] != b':'
-        || s[19] != b'Z'
+fn parse_2_digits(s: &[u8]) -> Option<i64> {
+    if s.len() != 2 || !s[0].is_ascii_digit() || !s[1].is_ascii_digit() {
+        return None;
+    }
+    Some((s[0] - b'0') as i64 * 10 + (s[1] - b'0') as i64)
+}
+
+#[inline(always)]
+fn parse_4_digits(s: &[u8]) -> Option<i64> {
+    if s.len() != 4
+        || !s[0].is_ascii_digit()
+        || !s[1].is_ascii_digit()
+        || !s[2].is_ascii_digit()
+        || !s[3].is_ascii_digit()
     {
         return None;
     }
-    let y0 = s[0].wrapping_sub(b'0');
-    let y1 = s[1].wrapping_sub(b'0');
-    let y2 = s[2].wrapping_sub(b'0');
-    let y3 = s[3].wrapping_sub(b'0');
-    let m0 = s[5].wrapping_sub(b'0');
-    let m1 = s[6].wrapping_sub(b'0');
-    let d0 = s[8].wrapping_sub(b'0');
-    let d1 = s[9].wrapping_sub(b'0');
-    let h0 = s[11].wrapping_sub(b'0');
-    let h1 = s[12].wrapping_sub(b'0');
-    let mi0 = s[14].wrapping_sub(b'0');
-    let mi1 = s[15].wrapping_sub(b'0');
-    let se0 = s[17].wrapping_sub(b'0');
-    let se1 = s[18].wrapping_sub(b'0');
+    Some(
+        (s[0] - b'0') as i64 * 1000
+            + (s[1] - b'0') as i64 * 100
+            + (s[2] - b'0') as i64 * 10
+            + (s[3] - b'0') as i64,
+    )
+}
 
-    if (y0 | y1 | y2 | y3 | m0 | m1 | d0 | d1 | h0 | h1 | mi0 | mi1 | se0 | se1) > 9 {
+#[inline(always)]
+fn parse_iso_f1(s: &[u8]) -> Option<i64> {
+    if s.len() != 20
+        || s[10] != b'T'
+        || s[19] != b'Z'
+        || s[4] != b'-'
+        || s[7] != b'-'
+        || s[13] != b':'
+        || s[16] != b':'
+    {
         return None;
     }
-
-    let y = y0 as i64 * 1000 + y1 as i64 * 100 + y2 as i64 * 10 + y3 as i64;
-    let m = m0 as i64 * 10 + m1 as i64;
-    let d = d0 as i64 * 10 + d1 as i64;
-    let h = h0 as i64 * 10 + h1 as i64;
-    let mi = mi0 as i64 * 10 + mi1 as i64;
-    let se = se0 as i64 * 10 + se1 as i64;
+    for &idx in &[0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18] {
+        if !s[idx].is_ascii_digit() {
+            return None;
+        }
+    }
+    let y = parse_4_digits(&s[0..4])?;
+    let m = parse_2_digits(&s[5..7])?;
+    let d = parse_2_digits(&s[8..10])?;
+    let h = parse_2_digits(&s[11..13])?;
+    let mi = parse_2_digits(&s[14..16])?;
+    let se = parse_2_digits(&s[17..19])?;
 
     if !(1..=12).contains(&m) || !(0..=23).contains(&h) || !(0..=59).contains(&mi) || !(0..=59).contains(&se) {
         return None;
@@ -84,9 +96,9 @@ fn parse_iso_f1(s: &[u8]) -> Option<i64> {
 #[inline(always)]
 fn parse_iso_f2(s: &[u8]) -> Option<i64> {
     if s.len() != 25
+        || s[10] != b'T'
         || s[4] != b'-'
         || s[7] != b'-'
-        || s[10] != b'T'
         || s[13] != b':'
         || s[16] != b':'
         || s[22] != b':'
@@ -97,36 +109,19 @@ fn parse_iso_f2(s: &[u8]) -> Option<i64> {
     if sign != b'+' && sign != b'-' {
         return None;
     }
-    let y0 = s[0].wrapping_sub(b'0');
-    let y1 = s[1].wrapping_sub(b'0');
-    let y2 = s[2].wrapping_sub(b'0');
-    let y3 = s[3].wrapping_sub(b'0');
-    let m0 = s[5].wrapping_sub(b'0');
-    let m1 = s[6].wrapping_sub(b'0');
-    let d0 = s[8].wrapping_sub(b'0');
-    let d1 = s[9].wrapping_sub(b'0');
-    let h0 = s[11].wrapping_sub(b'0');
-    let h1 = s[12].wrapping_sub(b'0');
-    let mi0 = s[14].wrapping_sub(b'0');
-    let mi1 = s[15].wrapping_sub(b'0');
-    let se0 = s[17].wrapping_sub(b'0');
-    let se1 = s[18].wrapping_sub(b'0');
-    let oh0 = s[20].wrapping_sub(b'0');
-    let oh1 = s[21].wrapping_sub(b'0');
-    let omi0 = s[23].wrapping_sub(b'0');
-    let omi1 = s[24].wrapping_sub(b'0');
-
-    if (y0 | y1 | y2 | y3 | m0 | m1 | d0 | d1 | h0 | h1 | mi0 | mi1 | se0 | se1 | oh0 | oh1 | omi0 | omi1) > 9 {
-        return None;
+    for &idx in &[0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 23, 24] {
+        if !s[idx].is_ascii_digit() {
+            return None;
+        }
     }
-    let y = y0 as i64 * 1000 + y1 as i64 * 100 + y2 as i64 * 10 + y3 as i64;
-    let m = m0 as i64 * 10 + m1 as i64;
-    let d = d0 as i64 * 10 + d1 as i64;
-    let h = h0 as i64 * 10 + h1 as i64;
-    let mi = mi0 as i64 * 10 + mi1 as i64;
-    let se = se0 as i64 * 10 + se1 as i64;
-    let oh = oh0 as i64 * 10 + oh1 as i64;
-    let omi = omi0 as i64 * 10 + omi1 as i64;
+    let y = parse_4_digits(&s[0..4])?;
+    let m = parse_2_digits(&s[5..7])?;
+    let d = parse_2_digits(&s[8..10])?;
+    let h = parse_2_digits(&s[11..13])?;
+    let mi = parse_2_digits(&s[14..16])?;
+    let se = parse_2_digits(&s[17..19])?;
+    let oh = parse_2_digits(&s[20..22])?;
+    let omi = parse_2_digits(&s[23..25])?;
 
     if !(1..=12).contains(&m)
         || !(0..=23).contains(&h)
