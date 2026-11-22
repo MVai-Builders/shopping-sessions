@@ -415,8 +415,8 @@ struct Manifest {
     window_end: String,
 }
 
-const NUM_EVENT_SHARDS: usize = 16;
-const NUM_PERSON_SHARDS: usize = 16;
+const NUM_EVENT_SHARDS: usize = 64;
+const NUM_PERSON_SHARDS: usize = 64;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args: Vec<String> = env::args().collect();
@@ -883,6 +883,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             let mut camp_counts: Vec<u32> = vec![0; n_campaigns];
             let mut active_camps: Vec<u32> = Vec::with_capacity(32);
+            let mut active_pos: Vec<usize> = vec![usize::MAX; n_campaigns];
 
             struct PersonDayAgg {
                 sessions: i64,
@@ -970,6 +971,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 // 2. Two-pointer sliding window over person_clicks
                 let mut win_left = 0;
                 let mut win_right = 0;
+                let mut latest_group_start = 0;
 
                 for sess in &sessions {
                     let s_start = sess.start_ts;
@@ -999,9 +1001,14 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                     // Advance win_right: add incoming clicks
                     while win_right < person_clicks.len() && person_clicks[win_right].ts <= s_start {
+                        let cur_ts = person_clicks[win_right].ts;
+                        if win_right == 0 || cur_ts > person_clicks[win_right - 1].ts {
+                            latest_group_start = win_right;
+                        }
                         let cid = person_clicks[win_right].camp_id as usize;
                         if cid != (ORGANIC_CAMP_ID as usize) {
                             if camp_counts[cid] == 0 {
+                                active_pos[cid] = active_camps.len();
                                 active_camps.push(person_clicks[win_right].camp_id);
                             }
                             camp_counts[cid] += 1;
@@ -1010,26 +1017,26 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
 
                     // Advance win_left: remove expired clicks
-                    let prev_left = win_left;
                     while win_left < win_right && person_clicks[win_left].ts < win_start {
                         let cid = person_clicks[win_left].camp_id as usize;
                         if cid != (ORGANIC_CAMP_ID as usize) {
                             camp_counts[cid] -= 1;
+                            if camp_counts[cid] == 0 {
+                                let pos = active_pos[cid];
+                                let last = active_camps.pop().unwrap();
+                                if pos < active_camps.len() {
+                                    active_camps[pos] = last;
+                                    active_pos[last as usize] = pos;
+                                }
+                                active_pos[cid] = usize::MAX;
+                            }
                         }
                         win_left += 1;
-                    }
-                    if win_left > prev_left {
-                        active_camps.retain(|&id| camp_counts[id as usize] > 0);
                     }
 
                     // Credited click from the tail of the window (latest ts, tie break smallest cid)
                     let credited_camp_id = if win_left < win_right {
-                        let latest_ts = person_clicks[win_right - 1].ts;
-                        let mut best_idx = win_right - 1;
-                        while best_idx > win_left && person_clicks[best_idx - 1].ts == latest_ts {
-                            best_idx -= 1;
-                        }
-                        person_clicks[best_idx].camp_id
+                        person_clicks[latest_group_start].camp_id
                     } else {
                         ORGANIC_CAMP_ID
                     };
@@ -1051,6 +1058,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 // Clean up camp_counts and active_camps for the next person
                 for &id in &active_camps {
                     camp_counts[id as usize] = 0;
+                    active_pos[id as usize] = usize::MAX;
                 }
                 active_camps.clear();
 
