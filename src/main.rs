@@ -881,8 +881,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let mut user_records = Vec::with_capacity(p_events.len() / 10);
             let mut camp_daily_arr: Vec<CampaignDailyEntry> = vec![CampaignDailyEntry::default(); total_camp_entries];
 
-            let mut assist_seen: Vec<bool> = vec![false; n_campaigns];
-            let mut dirty_camps: Vec<u32> = Vec::with_capacity(64);
+            let mut camp_counts: Vec<u32> = vec![0; n_campaigns];
+            let mut active_camps: Vec<u32> = Vec::with_capacity(32);
 
             struct PersonDayAgg {
                 sessions: i64,
@@ -892,6 +892,15 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             let mut person_daily_arr: Vec<Option<PersonDayAgg>> = (0..n_days.max(1)).map(|_| None).collect();
             let mut used_days: Vec<usize> = Vec::with_capacity(n_days.min(64));
+
+            struct LocalSession {
+                start_ts: i64,
+                events: i64,
+                revenue: i64,
+                purchases: i64,
+                cat_rev: [i64; 32],
+            }
+            let mut sessions: Vec<LocalSession> = Vec::with_capacity(64);
 
             let mut p_start = 0;
             while p_start < p_events.len() {
@@ -918,102 +927,132 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
                 used_days.clear();
 
-                let mut sess_start_ts = person_events[0].ts;
-                let mut sess_prev_ts = person_events[0].ts;
-                let mut sess_events = 0i64;
-                let mut sess_revenue = 0i64;
-                let mut sess_purchases = 0i64;
-                let mut sess_cat_rev = [0i64; 32];
-
-                macro_rules! flush_session {
-                    () => {{
-                        let s_start_ts = sess_start_ts;
-                        let day_epoch = s_start_ts.div_euclid(86_400_000) as i32;
-                        let d_idx = (day_epoch - w_start_day) as usize;
-
-                        if d_idx < person_daily_arr.len() {
-                            if person_daily_arr[d_idx].is_none() {
-                                person_daily_arr[d_idx] = Some(PersonDayAgg {
-                                    sessions: 0,
-                                    events: 0,
-                                    revenue: 0,
-                                    cat_rev: [0; 32],
-                                });
-                                used_days.push(d_idx);
-                            }
-                            let pd = person_daily_arr[d_idx].as_mut().unwrap();
-                            pd.sessions += 1;
-                            pd.events += sess_events;
-                            pd.revenue += sess_revenue;
-                            for i in 0..32 {
-                                pd.cat_rev[i] += sess_cat_rev[i];
-                            }
-                        }
-
-                        let win_start = s_start_ts - SEVEN_DAYS_MS;
-                        let lo = person_clicks.partition_point(|c| c.ts < win_start);
-
-                        dirty_camps.clear();
-                        let mut best_click: Option<(i64, &[u8], u32)> = None;
-
-                        for c in &person_clicks[lo..] {
-                            if c.ts > s_start_ts {
-                                break;
-                            }
-                            let cid_usize = c.camp_id as usize;
-                            if cid_usize < assist_seen.len() && !assist_seen[cid_usize] {
-                                assist_seen[cid_usize] = true;
-                                dirty_camps.push(c.camp_id);
-                            }
-                            if let Some(best) = &mut best_click {
-                                if c.ts > best.0 {
-                                    *best = (c.ts, c.cid, c.camp_id);
-                                } else if c.ts == best.0 && c.cid < best.1 {
-                                    *best = (c.ts, c.cid, c.camp_id);
-                                }
-                            } else {
-                                best_click = Some((c.ts, c.cid, c.camp_id));
-                            }
-                        }
-
-                        let credited_camp_id = best_click.map(|b| b.2).unwrap_or(ORGANIC_CAMP_ID);
-                        let idx = (credited_camp_id as usize) * n_days + d_idx;
-                        let cd = &mut camp_daily_arr[idx];
-                        cd.sessions += 1;
-                        if sess_purchases > 0 {
-                            cd.purchasing_sessions += 1;
-                        }
-                        cd.revenue += sess_revenue;
-
-                        for &camp_id in &dirty_camps {
-                            let aidx = (camp_id as usize) * n_days + d_idx;
-                            camp_daily_arr[aidx].assisted_sessions += 1;
-                        }
-
-                        for &id in &dirty_camps {
-                            assist_seen[id as usize] = false;
-                        }
-                    }};
-                }
+                // 1. Group events into sessions
+                sessions.clear();
+                let mut s_start_ts = person_events[0].ts;
+                let mut s_prev_ts = person_events[0].ts;
+                let mut s_events = 0i64;
+                let mut s_revenue = 0i64;
+                let mut s_purchases = 0i64;
+                let mut s_cat_rev = [0i64; 32];
 
                 for ev in person_events {
-                    if (ev.ts - sess_prev_ts) > THIRTY_MIN_MS {
-                        flush_session!();
-                        sess_start_ts = ev.ts;
-                        sess_events = 0;
-                        sess_revenue = 0;
-                        sess_purchases = 0;
-                        sess_cat_rev = [0; 32];
+                    if (ev.ts - s_prev_ts) > THIRTY_MIN_MS {
+                        sessions.push(LocalSession {
+                            start_ts: s_start_ts,
+                            events: s_events,
+                            revenue: s_revenue,
+                            purchases: s_purchases,
+                            cat_rev: s_cat_rev,
+                        });
+                        s_start_ts = ev.ts;
+                        s_events = 0;
+                        s_revenue = 0;
+                        s_purchases = 0;
+                        s_cat_rev = [0; 32];
                     }
-                    sess_prev_ts = ev.ts;
-                    sess_events += 1;
+                    s_prev_ts = ev.ts;
+                    s_events += 1;
                     if ev.etype == 3 {
-                        sess_purchases += 1;
-                        sess_revenue += ev.price_cents as i64;
-                        sess_cat_rev[ev.category as usize] += ev.price_cents as i64;
+                        s_purchases += 1;
+                        s_revenue += ev.price_cents as i64;
+                        s_cat_rev[ev.category as usize] += ev.price_cents as i64;
                     }
                 }
-                flush_session!();
+                sessions.push(LocalSession {
+                    start_ts: s_start_ts,
+                    events: s_events,
+                    revenue: s_revenue,
+                    purchases: s_purchases,
+                    cat_rev: s_cat_rev,
+                });
+
+                // 2. Two-pointer sliding window over person_clicks
+                let mut win_left = 0;
+                let mut win_right = 0;
+
+                for sess in &sessions {
+                    let s_start = sess.start_ts;
+                    let day_epoch = s_start.div_euclid(86_400_000) as i32;
+                    let d_idx = (day_epoch - w_start_day) as usize;
+
+                    if d_idx < person_daily_arr.len() {
+                        if person_daily_arr[d_idx].is_none() {
+                            person_daily_arr[d_idx] = Some(PersonDayAgg {
+                                sessions: 0,
+                                events: 0,
+                                revenue: 0,
+                                cat_rev: [0; 32],
+                            });
+                            used_days.push(d_idx);
+                        }
+                        let pd = person_daily_arr[d_idx].as_mut().unwrap();
+                        pd.sessions += 1;
+                        pd.events += sess.events;
+                        pd.revenue += sess.revenue;
+                        for i in 0..32 {
+                            pd.cat_rev[i] += sess.cat_rev[i];
+                        }
+                    }
+
+                    let win_start = s_start - SEVEN_DAYS_MS;
+
+                    // Advance win_right: add incoming clicks
+                    while win_right < person_clicks.len() && person_clicks[win_right].ts <= s_start {
+                        let cid = person_clicks[win_right].camp_id as usize;
+                        if cid != (ORGANIC_CAMP_ID as usize) {
+                            if camp_counts[cid] == 0 {
+                                active_camps.push(person_clicks[win_right].camp_id);
+                            }
+                            camp_counts[cid] += 1;
+                        }
+                        win_right += 1;
+                    }
+
+                    // Advance win_left: remove expired clicks
+                    let prev_left = win_left;
+                    while win_left < win_right && person_clicks[win_left].ts < win_start {
+                        let cid = person_clicks[win_left].camp_id as usize;
+                        if cid != (ORGANIC_CAMP_ID as usize) {
+                            camp_counts[cid] -= 1;
+                        }
+                        win_left += 1;
+                    }
+                    if win_left > prev_left {
+                        active_camps.retain(|&id| camp_counts[id as usize] > 0);
+                    }
+
+                    // Credited click from the tail of the window (latest ts, tie break smallest cid)
+                    let credited_camp_id = if win_left < win_right {
+                        let latest_ts = person_clicks[win_right - 1].ts;
+                        let mut best_idx = win_right - 1;
+                        while best_idx > win_left && person_clicks[best_idx - 1].ts == latest_ts {
+                            best_idx -= 1;
+                        }
+                        person_clicks[best_idx].camp_id
+                    } else {
+                        ORGANIC_CAMP_ID
+                    };
+
+                    let idx = (credited_camp_id as usize) * n_days + d_idx;
+                    let cd = &mut camp_daily_arr[idx];
+                    cd.sessions += 1;
+                    if sess.purchases > 0 {
+                        cd.purchasing_sessions += 1;
+                    }
+                    cd.revenue += sess.revenue;
+
+                    for &camp_id in &active_camps {
+                        let aidx = (camp_id as usize) * n_days + d_idx;
+                        camp_daily_arr[aidx].assisted_sessions += 1;
+                    }
+                }
+
+                // Clean up camp_counts and active_camps for the next person
+                for &id in &active_camps {
+                    camp_counts[id as usize] = 0;
+                }
+                active_camps.clear();
 
                 for &d_idx in &used_days {
                     let pd = person_daily_arr[d_idx].as_ref().unwrap();
