@@ -34,28 +34,30 @@ fn days_from_civil(mut y: i64, m: i64, d: i64) -> i32 {
 
 #[inline(always)]
 fn parse_2_digits(s: &[u8]) -> Option<i64> {
-    if s.len() != 2 || !s[0].is_ascii_digit() || !s[1].is_ascii_digit() {
+    if s.len() != 2 {
         return None;
     }
-    Some((s[0] - b'0') as i64 * 10 + (s[1] - b'0') as i64)
+    let d0 = s[0].wrapping_sub(b'0');
+    let d1 = s[1].wrapping_sub(b'0');
+    if d0 > 9 || d1 > 9 {
+        return None;
+    }
+    Some((d0 as i64) * 10 + (d1 as i64))
 }
 
 #[inline(always)]
 fn parse_4_digits(s: &[u8]) -> Option<i64> {
-    if s.len() != 4
-        || !s[0].is_ascii_digit()
-        || !s[1].is_ascii_digit()
-        || !s[2].is_ascii_digit()
-        || !s[3].is_ascii_digit()
-    {
+    if s.len() != 4 {
         return None;
     }
-    Some(
-        (s[0] - b'0') as i64 * 1000
-            + (s[1] - b'0') as i64 * 100
-            + (s[2] - b'0') as i64 * 10
-            + (s[3] - b'0') as i64,
-    )
+    let d0 = s[0].wrapping_sub(b'0');
+    let d1 = s[1].wrapping_sub(b'0');
+    let d2 = s[2].wrapping_sub(b'0');
+    let d3 = s[3].wrapping_sub(b'0');
+    if d0 > 9 || d1 > 9 || d2 > 9 || d3 > 9 {
+        return None;
+    }
+    Some((d0 as i64) * 1000 + (d1 as i64) * 100 + (d2 as i64) * 10 + (d3 as i64))
 }
 
 #[inline(always)]
@@ -69,11 +71,6 @@ fn parse_iso_f1(s: &[u8]) -> Option<i64> {
         || s[16] != b':'
     {
         return None;
-    }
-    for &idx in &[0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18] {
-        if !s[idx].is_ascii_digit() {
-            return None;
-        }
     }
     let y = parse_4_digits(&s[0..4])?;
     let m = parse_2_digits(&s[5..7])?;
@@ -108,11 +105,6 @@ fn parse_iso_f2(s: &[u8]) -> Option<i64> {
     let sign = s[19];
     if sign != b'+' && sign != b'-' {
         return None;
-    }
-    for &idx in &[0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 23, 24] {
-        if !s[idx].is_ascii_digit() {
-            return None;
-        }
     }
     let y = parse_4_digits(&s[0..4])?;
     let m = parse_2_digits(&s[5..7])?;
@@ -155,10 +147,14 @@ fn parse_timestamp(s: &[u8]) -> Option<i64> {
     if s.len() == 25 && (s[19] == b'+' || s[19] == b'-') {
         return parse_iso_f2(s);
     }
-    if !s.is_empty() && s.iter().all(|&b| b.is_ascii_digit()) {
+    if !s.is_empty() {
         let mut val = 0i64;
         for &b in s {
-            val = val.checked_mul(10)?.checked_add((b - b'0') as i64)?;
+            let d = b.wrapping_sub(b'0');
+            if d > 9 {
+                return None;
+            }
+            val = val.checked_mul(10)?.checked_add(d as i64)?;
         }
         return Some(val);
     }
@@ -183,10 +179,71 @@ fn fast_hash(bytes: &[u8]) -> u64 {
     h
 }
 
+// ─── Pass-Through Zero-Cost Hasher for Pre-Hashed Keys ─────────────────────────
+
+#[derive(Clone, Copy)]
+struct ShardKey<'a> {
+    hash: u64,
+    bytes: &'a [u8],
+}
+
+impl<'a> PartialEq for ShardKey<'a> {
+    #[inline(always)]
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash && self.bytes == other.bytes
+    }
+}
+impl<'a> Eq for ShardKey<'a> {}
+
+impl<'a> std::hash::Hash for ShardKey<'a> {
+    #[inline(always)]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
+#[derive(Default)]
+struct PassThroughHasher(u64);
+
+impl std::hash::Hasher for PassThroughHasher {
+    #[inline(always)]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline(always)]
+    fn write(&mut self, _bytes: &[u8]) {}
+    #[inline(always)]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = i;
+    }
+}
+
+type PassThroughBuildHasher = std::hash::BuildHasherDefault<PassThroughHasher>;
+
 // ─── Fast Zero-Copy CSV Dialect With Single-Pass Quote Tracking ──────────────
 
 #[inline(always)]
 fn parse_line_7<'a>(line: &'a [u8], cols: &mut [&'a [u8]; 7]) -> bool {
+    if memchr::memchr(b'"', line).is_none() {
+        let mut start = 0;
+        let mut col_idx = 0;
+        for (i, &b) in line.iter().enumerate() {
+            if b == b',' {
+                if col_idx >= 6 {
+                    return false;
+                }
+                cols[col_idx] = &line[start..i];
+                col_idx += 1;
+                start = i + 1;
+            }
+        }
+        if col_idx != 6 {
+            return false;
+        }
+        cols[6] = &line[start..];
+        return true;
+    }
+
     let mut start = 0;
     let mut col_idx = 0;
     let mut has_quote = false;
@@ -233,6 +290,26 @@ fn parse_line_7<'a>(line: &'a [u8], cols: &mut [&'a [u8]; 7]) -> bool {
 
 #[inline(always)]
 fn parse_line_4<'a>(line: &'a [u8], cols: &mut [&'a [u8]; 4]) -> bool {
+    if memchr::memchr(b'"', line).is_none() {
+        let mut start = 0;
+        let mut col_idx = 0;
+        for (i, &b) in line.iter().enumerate() {
+            if b == b',' {
+                if col_idx >= 3 {
+                    return false;
+                }
+                cols[col_idx] = &line[start..i];
+                col_idx += 1;
+                start = i + 1;
+            }
+        }
+        if col_idx != 3 {
+            return false;
+        }
+        cols[3] = &line[start..];
+        return true;
+    }
+
     let mut start = 0;
     let mut col_idx = 0;
     let mut has_quote = false;
@@ -279,6 +356,26 @@ fn parse_line_4<'a>(line: &'a [u8], cols: &mut [&'a [u8]; 4]) -> bool {
 
 #[inline(always)]
 fn parse_line_2<'a>(line: &'a [u8], cols: &mut [&'a [u8]; 2]) -> bool {
+    if memchr::memchr(b'"', line).is_none() {
+        let mut start = 0;
+        let mut col_idx = 0;
+        for (i, &b) in line.iter().enumerate() {
+            if b == b',' {
+                if col_idx >= 1 {
+                    return false;
+                }
+                cols[col_idx] = &line[start..i];
+                col_idx += 1;
+                start = i + 1;
+            }
+        }
+        if col_idx != 1 {
+            return false;
+        }
+        cols[1] = &line[start..];
+        return true;
+    }
+
     let mut start = 0;
     let mut col_idx = 0;
     let mut has_quote = false;
@@ -321,6 +418,43 @@ fn parse_line_2<'a>(line: &'a [u8], cols: &mut [&'a [u8]; 2]) -> bool {
     }
     cols[1] = field;
     true
+}
+
+// ─── Parallel Mmap Chunking for Perfect Work-Stealing Load Balancing ─────────
+
+struct FileChunk<'a> {
+    data: &'a [u8],
+    is_first_chunk: bool,
+}
+
+fn create_chunks<'a>(mmaps: &'a [Mmap], chunk_size: usize) -> Vec<FileChunk<'a>> {
+    let mut chunks = Vec::new();
+    for mmap in mmaps {
+        let bytes = mmap.as_ref();
+        let len = bytes.len();
+        if len == 0 {
+            continue;
+        }
+        let mut start = 0;
+        let mut is_first = true;
+        while start < len {
+            let mut end = (start + chunk_size).min(len);
+            if end < len {
+                if let Some(pos) = memchr::memchr(b'\n', &bytes[end..]) {
+                    end += pos + 1;
+                } else {
+                    end = len;
+                }
+            }
+            chunks.push(FileChunk {
+                data: &bytes[start..end],
+                is_first_chunk: is_first,
+            });
+            start = end;
+            is_first = false;
+        }
+    }
+    chunks
 }
 
 // ─── DSU for Linked IDs ──────────────────────────────────────────────────────
@@ -374,6 +508,7 @@ impl Dsu {
 
 #[derive(Clone, Copy)]
 struct RawEvent<'a> {
+    eid_hash: u64,
     ingest_ms: i64,
     eid: &'a [u8],
     uid: &'a [u8],
@@ -395,6 +530,7 @@ struct FastEvent<'a> {
 
 #[derive(Clone, Copy)]
 struct RawClick<'a> {
+    cid_hash: u64,
     cid: &'a [u8],
     uid: &'a [u8],
     camp_bytes: &'a [u8],
@@ -430,6 +566,7 @@ const NUM_EVENT_SHARDS: usize = 64;
 const NUM_PERSON_SHARDS: usize = 64;
 const SHARD_MASK: usize = 63;
 const MAX_CATEGORIES: usize = 64;
+const PARSE_CHUNK_SIZE: usize = 8 * 1024 * 1024; // 8 MB chunks for perfect cache & thread balance
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Ok(ncpu_str) = env::var("NCPU") {
@@ -538,16 +675,18 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
-    let mut resolved_links: HashMap<Vec<u8>, (u64, Arc<[u8]>)> = HashMap::with_capacity(dsu.parent.len());
+    let mut resolved_links: HashMap<Vec<u8>, (u64, Arc<[u8]>)> = HashMap::with_capacity(dsu.parent.len() * 2);
     let keys: Vec<Vec<u8>> = dsu.parent.keys().cloned().collect();
     for k in keys {
         let root = dsu.find(&k);
         let h = fast_hash(&root);
-        resolved_links.insert(k, (h, Arc::from(root.into_boxed_slice())));
+        let arc_root: Arc<[u8]> = Arc::from(root.clone().into_boxed_slice());
+        resolved_links.insert(k, (h, arc_root.clone()));
+        resolved_links.entry(root).or_insert((h, arc_root));
     }
     let resolved_links = Arc::new(resolved_links);
 
-    // 4. Events: PARALLEL SCAN & DEDUP DIRECTLY INTO PERSON BINS
+    // 4. Events: PARALLEL WORK-STEALING CHUNK SCAN & DEDUP DIRECTLY INTO PERSON BINS
     let events_pattern = format!("{}/events/*.csv", data_dir);
     let mut event_files: Vec<PathBuf> = glob::glob(&events_pattern)?
         .filter_map(Result::ok)
@@ -562,22 +701,27 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
-    let thread_event_shards: Vec<Vec<Vec<RawEvent>>> = mmaps
+    let event_chunks = create_chunks(&mmaps, PARSE_CHUNK_SIZE);
+
+    let thread_event_shards: Vec<Vec<Vec<RawEvent>>> = event_chunks
         .par_iter()
-        .map(|mmap| {
+        .map(|chunk| {
+            let bytes = chunk.data;
             let mut shards: Vec<Vec<RawEvent>> = (0..NUM_EVENT_SHARDS)
-                .map(|_| Vec::with_capacity(mmap.len() / (80 * NUM_EVENT_SHARDS)))
+                .map(|_| Vec::with_capacity(bytes.len() / (80 * NUM_EVENT_SHARDS) + 16))
                 .collect();
             let mut cols = [b"".as_slice(); 7];
-            let bytes = mmap.as_ref();
             let mut start = 0;
-            let mut line_num = 0;
+            let mut is_first_line = chunk.is_first_chunk;
 
             for end in memchr::memchr_iter(b'\n', bytes) {
                 let line = &bytes[start..end];
                 start = end + 1;
-                line_num += 1;
-                if line_num == 1 || line.is_empty() {
+                if is_first_line {
+                    is_first_line = false;
+                    continue;
+                }
+                if line.is_empty() {
                     continue;
                 }
                 if parse_line_7(line, &mut cols) {
@@ -593,17 +737,24 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             let mut price_cents = 0u32;
                             if etype == 3 {
                                 let pr = cols[6];
-                                if pr.is_empty() || !pr.iter().all(|&b| b.is_ascii_digit()) {
+                                if pr.is_empty() {
                                     etype = 0;
                                 } else {
                                     let mut p = 0u64;
+                                    let mut valid_pr = true;
                                     for &b in pr {
-                                        p = p * 10 + (b - b'0') as u64;
+                                        let d = b.wrapping_sub(b'0');
+                                        if d > 9 {
+                                            valid_pr = false;
+                                            break;
+                                        }
+                                        p = p * 10 + d as u64;
                                         if p > 10_000_000 {
+                                            valid_pr = false;
                                             break;
                                         }
                                     }
-                                    if !(1..=10_000_000).contains(&p) {
+                                    if !valid_pr || p == 0 {
                                         etype = 0;
                                     } else {
                                         price_cents = p as u32;
@@ -613,6 +764,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             let eid_hash = fast_hash(eid);
                             let shard = (eid_hash as usize) & SHARD_MASK;
                             shards[shard].push(RawEvent {
+                                eid_hash,
                                 ingest_ms,
                                 eid,
                                 uid: cols[1],
@@ -627,7 +779,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             if start < bytes.len() {
                 let line = &bytes[start..];
-                if line_num > 0 && !line.is_empty() && parse_line_7(line, &mut cols) {
+                if !is_first_line && !line.is_empty() && parse_line_7(line, &mut cols) {
                     let eid = cols[0];
                     if !eid.is_empty() {
                         if let Some(ingest_ms) = parse_iso_f1(cols[3]) {
@@ -640,17 +792,24 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             let mut price_cents = 0u32;
                             if etype == 3 {
                                 let pr = cols[6];
-                                if pr.is_empty() || !pr.iter().all(|&b| b.is_ascii_digit()) {
+                                if pr.is_empty() {
                                     etype = 0;
                                 } else {
                                     let mut p = 0u64;
+                                    let mut valid_pr = true;
                                     for &b in pr {
-                                        p = p * 10 + (b - b'0') as u64;
+                                        let d = b.wrapping_sub(b'0');
+                                        if d > 9 {
+                                            valid_pr = false;
+                                            break;
+                                        }
+                                        p = p * 10 + d as u64;
                                         if p > 10_000_000 {
+                                            valid_pr = false;
                                             break;
                                         }
                                     }
-                                    if !(1..=10_000_000).contains(&p) {
+                                    if !valid_pr || p == 0 {
                                         etype = 0;
                                     } else {
                                         price_cents = p as u32;
@@ -660,6 +819,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             let eid_hash = fast_hash(eid);
                             let shard = (eid_hash as usize) & SHARD_MASK;
                             shards[shard].push(RawEvent {
+                                eid_hash,
                                 ingest_ms,
                                 eid,
                                 uid: cols[1],
@@ -683,11 +843,16 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .into_par_iter()
         .map(|shard_idx| {
             let total_items: usize = thread_event_shards.iter().map(|ts| ts[shard_idx].len()).sum();
-            let mut dedup_map: HashMap<&'a [u8], RawEvent<'a>> = HashMap::with_capacity(total_items);
+            let mut dedup_map: HashMap<ShardKey<'a>, RawEvent<'a>, PassThroughBuildHasher> =
+                HashMap::with_capacity_and_hasher(total_items, PassThroughBuildHasher::default());
 
             for ts in &thread_event_shards {
                 for ev in &ts[shard_idx] {
-                    match dedup_map.entry(ev.eid) {
+                    let key = ShardKey {
+                        hash: ev.eid_hash,
+                        bytes: ev.eid,
+                    };
+                    match dedup_map.entry(key) {
                         hashbrown::hash_map::Entry::Vacant(v) => {
                             v.insert(*ev);
                         }
@@ -704,7 +869,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .map(|_| Vec::with_capacity(dedup_map.len() / NUM_PERSON_SHARDS + 32))
                 .collect();
 
-            for (_eid, best) in dedup_map {
+            for (_key, best) in dedup_map {
                 let uid = best.uid;
                 let pid = best.pid;
                 if uid.is_empty() || pid.is_empty() || best.etype == 0 {
@@ -743,7 +908,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .collect();
     drop(thread_event_shards);
 
-    // 5. Clicks: PARALLEL SCAN & DEDUP DIRECTLY INTO PERSON BINS
+    // 5. Clicks: PARALLEL WORK-STEALING CHUNK SCAN & DEDUP DIRECTLY INTO PERSON BINS
     let clicks_pattern = format!("{}/clicks/*.csv", data_dir);
     let mut click_files: Vec<PathBuf> = glob::glob(&clicks_pattern)?
         .filter_map(Result::ok)
@@ -758,22 +923,27 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
-    let thread_click_shards: Vec<Vec<Vec<RawClick>>> = click_mmaps
+    let click_chunks = create_chunks(&click_mmaps, PARSE_CHUNK_SIZE);
+
+    let thread_click_shards: Vec<Vec<Vec<RawClick>>> = click_chunks
         .par_iter()
-        .map(|mmap| {
+        .map(|chunk| {
+            let bytes = chunk.data;
             let mut shards: Vec<Vec<RawClick>> = (0..NUM_EVENT_SHARDS)
-                .map(|_| Vec::with_capacity(mmap.len() / (60 * NUM_EVENT_SHARDS)))
+                .map(|_| Vec::with_capacity(bytes.len() / (60 * NUM_EVENT_SHARDS) + 16))
                 .collect();
             let mut cols = [b"".as_slice(); 4];
-            let bytes = mmap.as_ref();
             let mut start = 0;
-            let mut line_num = 0;
+            let mut is_first_line = chunk.is_first_chunk;
 
             for end in memchr::memchr_iter(b'\n', bytes) {
                 let line = &bytes[start..end];
                 start = end + 1;
-                line_num += 1;
-                if line_num == 1 || line.is_empty() {
+                if is_first_line {
+                    is_first_line = false;
+                    continue;
+                }
+                if line.is_empty() {
                     continue;
                 }
                 if parse_line_4(line, &mut cols) {
@@ -782,6 +952,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         let cid_hash = fast_hash(cid);
                         let shard = (cid_hash as usize) & SHARD_MASK;
                         shards[shard].push(RawClick {
+                            cid_hash,
                             cid,
                             uid: cols[1],
                             camp_bytes: cols[2],
@@ -792,12 +963,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             if start < bytes.len() {
                 let line = &bytes[start..];
-                if line_num > 0 && !line.is_empty() && parse_line_4(line, &mut cols) {
+                if !is_first_line && !line.is_empty() && parse_line_4(line, &mut cols) {
                     let cid = cols[0];
                     if !cid.is_empty() {
                         let cid_hash = fast_hash(cid);
                         let shard = (cid_hash as usize) & SHARD_MASK;
                         shards[shard].push(RawClick {
+                            cid_hash,
                             cid,
                             uid: cols[1],
                             camp_bytes: cols[2],
@@ -814,7 +986,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .into_par_iter()
         .map(|shard_idx| {
             let total_items: usize = thread_click_shards.iter().map(|ts| ts[shard_idx].len()).sum();
-            let mut seen: hashbrown::HashSet<&'a [u8]> = hashbrown::HashSet::with_capacity(total_items);
+            let mut seen: hashbrown::HashSet<ShardKey<'a>, PassThroughBuildHasher> =
+                hashbrown::HashSet::with_capacity_and_hasher(total_items, PassThroughBuildHasher::default());
 
             let mut person_bins: Vec<Vec<FastClick>> = (0..NUM_PERSON_SHARDS)
                 .map(|_| Vec::with_capacity(total_items / NUM_PERSON_SHARDS + 16))
@@ -822,7 +995,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             for ts in &thread_click_shards {
                 for c in &ts[shard_idx] {
-                    if seen.insert(c.cid) {
+                    let key = ShardKey {
+                        hash: c.cid_hash,
+                        bytes: c.cid,
+                    };
+                    if seen.insert(key) {
                         let uid = c.uid;
                         if uid.is_empty() {
                             continue;
@@ -1127,112 +1304,123 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         })
         .collect();
 
-    // 7. PARQUET OUTPUT GENERATION (PARALLEL WRITE)
+    // 7. PARQUET OUTPUT GENERATION (PARALLEL MULTI-PART WRITERS ACROSS CORES)
     let u_dir = Path::new(&output_dir).join("user_daily");
     fs::create_dir_all(&u_dir)?;
     let c_dir = Path::new(&output_dir).join("campaign_daily");
     fs::create_dir_all(&c_dir)?;
 
-    let total_user_rows: usize = shard_results.iter().map(|(ur, _)| ur.len()).sum();
-    let mut u_ids_b = StringBuilder::with_capacity(total_user_rows, total_user_rows * 12);
-    let mut u_top_cat_b = StringBuilder::with_capacity(total_user_rows, total_user_rows * 10);
-    let mut u_days: Vec<i32> = Vec::with_capacity(total_user_rows);
-    let mut u_sessions: Vec<i64> = Vec::with_capacity(total_user_rows);
-    let mut u_events: Vec<i64> = Vec::with_capacity(total_user_rows);
-    let mut u_rev: Vec<i64> = Vec::with_capacity(total_user_rows);
+    let num_writers = 8usize;
+    let shards_per_writer = NUM_PERSON_SHARDS / num_writers;
 
-    let mut merged_camp_daily: Vec<CampaignDailyEntry> = vec![CampaignDailyEntry::default(); total_camp_entries];
+    let write_user_parquet = || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        (0..num_writers).into_par_iter().for_each(|writer_idx| {
+            let start_shard = writer_idx * shards_per_writer;
+            let end_shard = start_shard + shards_per_writer;
+            let total_rows: usize = (start_shard..end_shard)
+                .map(|s| shard_results[s].0.len())
+                .sum();
 
-    for (ur, cm) in shard_results {
-        for r in ur {
-            let s = unsafe { std::str::from_utf8_unchecked(r.person) };
-            u_ids_b.append_value(s);
-            u_days.push(r.day);
-            u_sessions.push(r.sessions);
-            u_events.push(r.events);
-            u_rev.push(r.revenue);
-            if let Some(idx) = r.top_category {
-                u_top_cat_b.append_value(&cat_names[idx as usize]);
-            } else {
-                u_top_cat_b.append_null();
+            if writer_idx == 0 || total_rows > 0 {
+                let mut u_ids_b = StringBuilder::with_capacity(total_rows, total_rows * 12);
+                let mut u_top_cat_b = StringBuilder::with_capacity(total_rows, total_rows * 10);
+                let mut u_days: Vec<i32> = Vec::with_capacity(total_rows);
+                let mut u_sessions: Vec<i64> = Vec::with_capacity(total_rows);
+                let mut u_events: Vec<i64> = Vec::with_capacity(total_rows);
+                let mut u_rev: Vec<i64> = Vec::with_capacity(total_rows);
+
+                for s in start_shard..end_shard {
+                    for r in &shard_results[s].0 {
+                        let s_str = unsafe { std::str::from_utf8_unchecked(r.person) };
+                        u_ids_b.append_value(s_str);
+                        u_days.push(r.day);
+                        u_sessions.push(r.sessions);
+                        u_events.push(r.events);
+                        u_rev.push(r.revenue);
+                        if let Some(idx) = r.top_category {
+                            u_top_cat_b.append_value(&cat_names_ref[idx as usize]);
+                        } else {
+                            u_top_cat_b.append_null();
+                        }
+                    }
+                }
+
+                let u_schema = Arc::new(Schema::new(vec![
+                    Field::new("user_id", DataType::Utf8, false),
+                    Field::new("day", DataType::Date32, false),
+                    Field::new("sessions", DataType::Int64, false),
+                    Field::new("events", DataType::Int64, false),
+                    Field::new("revenue_cents", DataType::Int64, false),
+                    Field::new("top_category", DataType::Utf8, true),
+                ]));
+
+                let u_batch = RecordBatch::try_new(
+                    u_schema.clone(),
+                    vec![
+                        Arc::new(u_ids_b.finish()) as ArrayRef,
+                        Arc::new(Date32Array::from(u_days)) as ArrayRef,
+                        Arc::new(Int64Array::from(u_sessions)) as ArrayRef,
+                        Arc::new(Int64Array::from(u_events)) as ArrayRef,
+                        Arc::new(Int64Array::from(u_rev)) as ArrayRef,
+                        Arc::new(u_top_cat_b.finish()) as ArrayRef,
+                    ],
+                ).expect("valid user batch");
+
+                let out_file_path = u_dir.join(format!("part-{}.parquet", writer_idx));
+                let u_file = File::create(out_file_path).expect("create user parquet file");
+                let props = WriterProperties::builder()
+                    .set_compression(parquet::basic::Compression::UNCOMPRESSED)
+                    .build();
+                let mut u_writer = ArrowWriter::try_new(u_file, u_schema, Some(props)).expect("create arrow writer");
+                u_writer.write(&u_batch).expect("write user batch");
+                u_writer.close().expect("close user writer");
             }
-        }
-        for i in 0..total_camp_entries {
-            let v = &cm[i];
-            if v.sessions > 0 || v.assisted_sessions > 0 {
-                let m = &mut merged_camp_daily[i];
-                m.sessions += v.sessions;
-                m.purchasing_sessions += v.purchasing_sessions;
-                m.revenue += v.revenue;
-                m.assisted_sessions += v.assisted_sessions;
-            }
-        }
-    }
-
-    let mut c_ids_b = StringBuilder::with_capacity(32768, 32768 * 8);
-    let mut c_channels_b = StringBuilder::with_capacity(32768, 32768 * 10);
-    let mut c_days: Vec<i32> = Vec::with_capacity(32768);
-    let mut c_sessions: Vec<i64> = Vec::with_capacity(32768);
-    let mut c_purchasing: Vec<i64> = Vec::with_capacity(32768);
-    let mut c_rev: Vec<i64> = Vec::with_capacity(32768);
-    let mut c_assisted: Vec<i64> = Vec::with_capacity(32768);
-
-    for camp_id in 0..n_campaigns {
-        for d in 0..n_days {
-            let idx = camp_id * n_days + d;
-            let data = &merged_camp_daily[idx];
-            if data.sessions > 0 || data.assisted_sessions > 0 {
-                let (cid_str, ch_str) = &campaign_names[camp_id];
-                let day_epoch = w_start_day + d as i32;
-                c_ids_b.append_value(cid_str);
-                c_channels_b.append_value(ch_str);
-                c_days.push(day_epoch);
-                c_sessions.push(data.sessions);
-                c_purchasing.push(data.purchasing_sessions);
-                c_rev.push(data.revenue);
-                c_assisted.push(data.assisted_sessions);
-            }
-        }
-    }
-
-    let u_ids_array = Arc::new(u_ids_b.finish()) as ArrayRef;
-    let u_top_cat_array = Arc::new(u_top_cat_b.finish()) as ArrayRef;
-    let c_ids_array = Arc::new(c_ids_b.finish()) as ArrayRef;
-    let c_channels_array = Arc::new(c_channels_b.finish()) as ArrayRef;
-
-    let write_user_parquet = move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let u_schema = Arc::new(Schema::new(vec![
-            Field::new("user_id", DataType::Utf8, false),
-            Field::new("day", DataType::Date32, false),
-            Field::new("sessions", DataType::Int64, false),
-            Field::new("events", DataType::Int64, false),
-            Field::new("revenue_cents", DataType::Int64, false),
-            Field::new("top_category", DataType::Utf8, true),
-        ]));
-
-        let u_batch = RecordBatch::try_new(
-            u_schema.clone(),
-            vec![
-                u_ids_array,
-                Arc::new(Date32Array::from(u_days)) as ArrayRef,
-                Arc::new(Int64Array::from(u_sessions)) as ArrayRef,
-                Arc::new(Int64Array::from(u_events)) as ArrayRef,
-                Arc::new(Int64Array::from(u_rev)) as ArrayRef,
-                u_top_cat_array,
-            ],
-        )?;
-
-        let u_file = File::create(u_dir.join("part-0.parquet"))?;
-        let props = WriterProperties::builder()
-            .set_compression(parquet::basic::Compression::UNCOMPRESSED)
-            .build();
-        let mut u_writer = ArrowWriter::try_new(u_file, u_schema, Some(props))?;
-        u_writer.write(&u_batch)?;
-        u_writer.close()?;
+        });
         Ok(())
     };
 
-    let write_camp_parquet = move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let write_camp_parquet = || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut merged_camp_daily: Vec<CampaignDailyEntry> = vec![CampaignDailyEntry::default(); total_camp_entries];
+
+        for (_, cm) in &shard_results {
+            for i in 0..total_camp_entries {
+                let v = &cm[i];
+                if v.sessions > 0 || v.assisted_sessions > 0 {
+                    let m = &mut merged_camp_daily[i];
+                    m.sessions += v.sessions;
+                    m.purchasing_sessions += v.purchasing_sessions;
+                    m.revenue += v.revenue;
+                    m.assisted_sessions += v.assisted_sessions;
+                }
+            }
+        }
+
+        let mut c_ids_b = StringBuilder::with_capacity(32768, 32768 * 8);
+        let mut c_channels_b = StringBuilder::with_capacity(32768, 32768 * 10);
+        let mut c_days: Vec<i32> = Vec::with_capacity(32768);
+        let mut c_sessions: Vec<i64> = Vec::with_capacity(32768);
+        let mut c_purchasing: Vec<i64> = Vec::with_capacity(32768);
+        let mut c_rev: Vec<i64> = Vec::with_capacity(32768);
+        let mut c_assisted: Vec<i64> = Vec::with_capacity(32768);
+
+        for camp_id in 0..n_campaigns {
+            for d in 0..n_days {
+                let idx = camp_id * n_days + d;
+                let data = &merged_camp_daily[idx];
+                if data.sessions > 0 || data.assisted_sessions > 0 {
+                    let (cid_str, ch_str) = &campaign_names[camp_id];
+                    let day_epoch = w_start_day + d as i32;
+                    c_ids_b.append_value(cid_str);
+                    c_channels_b.append_value(ch_str);
+                    c_days.push(day_epoch);
+                    c_sessions.push(data.sessions);
+                    c_purchasing.push(data.purchasing_sessions);
+                    c_rev.push(data.revenue);
+                    c_assisted.push(data.assisted_sessions);
+                }
+            }
+        }
+
         let c_schema = Arc::new(Schema::new(vec![
             Field::new("campaign_id", DataType::Utf8, false),
             Field::new("channel", DataType::Utf8, false),
@@ -1246,8 +1434,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let c_batch = RecordBatch::try_new(
             c_schema.clone(),
             vec![
-                c_ids_array,
-                c_channels_array,
+                Arc::new(c_ids_b.finish()) as ArrayRef,
+                Arc::new(c_channels_b.finish()) as ArrayRef,
                 Arc::new(Date32Array::from(c_days)) as ArrayRef,
                 Arc::new(Int64Array::from(c_sessions)) as ArrayRef,
                 Arc::new(Int64Array::from(c_purchasing)) as ArrayRef,
