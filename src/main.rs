@@ -372,10 +372,9 @@ struct RawEvent<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct FastEvent<'a> {
-    person_hash: u64,
-    person: &'a [u8],
+struct FastEvent {
     ts: i64,
+    person_id: u32,
     price_cents: u32,
     etype: u8,
     category: u8,
@@ -392,11 +391,10 @@ struct RawClick<'a> {
 
 #[derive(Clone, Copy)]
 struct FastClick<'a> {
-    person_hash: u64,
-    person: &'a [u8],
-    cid: &'a [u8],
     ts: i64,
+    person_id: u32,
     camp_id: u32,
+    cid: &'a [u8],
 }
 
 #[derive(Clone, Copy, Default)]
@@ -602,8 +600,122 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         })
         .collect();
 
+    // 5. Clicks: PARALLEL RAW SCAN
+    let clicks_pattern = format!("{}/clicks/*.csv", data_dir);
+    let mut click_files: Vec<PathBuf> = glob::glob(&clicks_pattern)?
+        .filter_map(Result::ok)
+        .collect();
+    click_files.sort();
+
+    let click_mmaps: Vec<Mmap> = click_files
+        .iter()
+        .map(|cf| {
+            let file = File::open(cf).expect("open click file");
+            unsafe { Mmap::map(&file).expect("mmap click file") }
+        })
+        .collect();
+
+    let thread_click_shards: Vec<Vec<Vec<RawClick>>> = click_mmaps
+        .par_iter()
+        .map(|mmap| {
+            let mut shards: Vec<Vec<RawClick>> = (0..NUM_EVENT_SHARDS)
+                .map(|_| Vec::with_capacity(mmap.len() / (60 * NUM_EVENT_SHARDS)))
+                .collect();
+            let mut cols = [b"".as_slice(); 4];
+            let bytes = mmap.as_ref();
+            let mut start = 0;
+            let mut line_num = 0;
+
+            for end in memchr::memchr_iter(b'\n', bytes) {
+                let line = &bytes[start..end];
+                start = end + 1;
+                line_num += 1;
+                if line_num == 1 || line.is_empty() {
+                    continue;
+                }
+                if parse_line_4(line, &mut cols) {
+                    let cid = cols[0];
+                    if !cid.is_empty() {
+                        let cid_hash = fnv1a(cid);
+                        let shard = (cid_hash as usize) % NUM_EVENT_SHARDS;
+                        shards[shard].push(RawClick {
+                            cid_hash,
+                            cid,
+                            uid: cols[1],
+                            camp_bytes: cols[2],
+                            ts_bytes: cols[3],
+                        });
+                    }
+                }
+            }
+            if start < bytes.len() {
+                let line = &bytes[start..];
+                if line_num > 0 && !line.is_empty() && parse_line_4(line, &mut cols) {
+                    let cid = cols[0];
+                    if !cid.is_empty() {
+                        let cid_hash = fnv1a(cid);
+                        let shard = (cid_hash as usize) % NUM_EVENT_SHARDS;
+                        shards[shard].push(RawClick {
+                            cid_hash,
+                            cid,
+                            uid: cols[1],
+                            camp_bytes: cols[2],
+                            ts_bytes: cols[3],
+                        });
+                    }
+                }
+            }
+            shards
+        })
+        .collect();
+
+    // 6. BUILD GLOBAL PERSON ID REGISTRY
+    let resolved_links_ref = resolved_links.as_ref();
+    let mut canonical_people: Vec<&[u8]> = Vec::with_capacity(1_500_000);
+
+    for ts in &thread_event_shards {
+        for s in ts {
+            for ev in s {
+                if !ev.uid.is_empty() {
+                    let canonical: &[u8] = match resolved_links_ref.get(ev.uid) {
+                        Some(root) => root.1.as_ref(),
+                        None => ev.uid,
+                    };
+                    canonical_people.push(canonical);
+                }
+            }
+        }
+    }
+    for ts in &thread_click_shards {
+        for s in ts {
+            for cl in s {
+                if !cl.uid.is_empty() {
+                    let canonical: &[u8] = match resolved_links_ref.get(cl.uid) {
+                        Some(root) => root.1.as_ref(),
+                        None => cl.uid,
+                    };
+                    canonical_people.push(canonical);
+                }
+            }
+        }
+    }
+
+    canonical_people.par_sort_unstable();
+    canonical_people.dedup();
+
+    let person_names: Vec<Arc<[u8]>> = canonical_people
+        .iter()
+        .map(|&name| Arc::from(name))
+        .collect();
+
+    let mut person_id_map: HashMap<&[u8], u32> = HashMap::with_capacity(person_names.len());
+    for (idx, name) in person_names.iter().enumerate() {
+        person_id_map.insert(name.as_ref(), idx as u32);
+    }
+    let person_id_map_ref = &person_id_map;
+    let person_names_ref = &person_names;
+
     let products_ref = &products;
-    let resolved_links_ref = &resolved_links;
 
     let event_person_shards: Vec<Vec<Vec<FastEvent>>> = (0..NUM_EVENT_SHARDS)
         .into_par_iter()
@@ -676,93 +788,26 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     continue;
                 }
 
-                let (person_hash, person_bytes): (u64, &[u8]) = match resolved_links_ref.get(uid) {
-                    Some(root) => (root.0, &root.1),
-                    None => (fnv1a(uid), uid),
+                let person_bytes: &[u8] = match resolved_links_ref.get(uid) {
+                    Some(root) => root.1.as_ref(),
+                    None => uid,
                 };
+                let person_id = *person_id_map_ref
+                    .get(person_bytes)
+                    .expect("Canonical event user missing from person ID registry");
 
                 let category = *products_ref.get(pid).unwrap_or(&unknown_cat_id);
 
-                let p_shard = (person_hash as usize) % NUM_PERSON_SHARDS;
+                let p_shard = (person_id as usize) % NUM_PERSON_SHARDS;
                 person_bins[p_shard].push(FastEvent {
-                    person_hash,
-                    person: person_bytes,
                     ts,
+                    person_id,
                     price_cents,
                     etype,
                     category,
                 });
             }
             person_bins
-        })
-        .collect();
-
-    // 5. Clicks: PARALLEL SCAN & DEDUP DIRECTLY INTO PERSON BINS
-    let clicks_pattern = format!("{}/clicks/*.csv", data_dir);
-    let mut click_files: Vec<PathBuf> = glob::glob(&clicks_pattern)?
-        .filter_map(Result::ok)
-        .collect();
-    click_files.sort();
-
-    let click_mmaps: Vec<Mmap> = click_files
-        .iter()
-        .map(|cf| {
-            let file = File::open(cf).expect("open click file");
-            unsafe { Mmap::map(&file).expect("mmap click file") }
-        })
-        .collect();
-
-    let thread_click_shards: Vec<Vec<Vec<RawClick>>> = click_mmaps
-        .par_iter()
-        .map(|mmap| {
-            let mut shards: Vec<Vec<RawClick>> = (0..NUM_EVENT_SHARDS)
-                .map(|_| Vec::with_capacity(mmap.len() / (60 * NUM_EVENT_SHARDS)))
-                .collect();
-            let mut cols = [b"".as_slice(); 4];
-            let bytes = mmap.as_ref();
-            let mut start = 0;
-            let mut line_num = 0;
-
-            for end in memchr::memchr_iter(b'\n', bytes) {
-                let line = &bytes[start..end];
-                start = end + 1;
-                line_num += 1;
-                if line_num == 1 || line.is_empty() {
-                    continue;
-                }
-                if parse_line_4(line, &mut cols) {
-                    let cid = cols[0];
-                    if !cid.is_empty() {
-                        let cid_hash = fnv1a(cid);
-                        let shard = (cid_hash as usize) % NUM_EVENT_SHARDS;
-                        shards[shard].push(RawClick {
-                            cid_hash,
-                            cid,
-                            uid: cols[1],
-                            camp_bytes: cols[2],
-                            ts_bytes: cols[3],
-                        });
-                    }
-                }
-            }
-            if start < bytes.len() {
-                let line = &bytes[start..];
-                if line_num > 0 && !line.is_empty() && parse_line_4(line, &mut cols) {
-                    let cid = cols[0];
-                    if !cid.is_empty() {
-                        let cid_hash = fnv1a(cid);
-                        let shard = (cid_hash as usize) % NUM_EVENT_SHARDS;
-                        shards[shard].push(RawClick {
-                            cid_hash,
-                            cid,
-                            uid: cols[1],
-                            camp_bytes: cols[2],
-                            ts_bytes: cols[3],
-                        });
-                    }
-                }
-            }
-            shards
         })
         .collect();
 
@@ -809,18 +854,20 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     continue;
                 }
 
-                let (person_hash, person_bytes): (u64, &[u8]) = match resolved_links_ref.get(uid) {
-                    Some(root) => (root.0, &root.1),
-                    None => (fnv1a(uid), uid),
+                let person_bytes: &[u8] = match resolved_links_ref.get(uid) {
+                    Some(root) => root.1.as_ref(),
+                    None => uid,
                 };
+                let person_id = *person_id_map_ref
+                    .get(person_bytes)
+                    .expect("Canonical click user missing from person ID registry");
 
-                let p_shard = (person_hash as usize) % NUM_PERSON_SHARDS;
+                let p_shard = (person_id as usize) % NUM_PERSON_SHARDS;
                 person_bins[p_shard].push(FastClick {
-                    person_hash,
-                    person: person_bytes,
-                    cid: best.cid,
                     ts,
+                    person_id,
                     camp_id,
+                    cid: best.cid,
                 });
             }
             person_bins
@@ -856,12 +903,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 p_events.extend_from_slice(&s[p_shard]);
             }
 
-            p_events.sort_unstable_by(|a, b| {
-                a.person_hash
-                    .cmp(&b.person_hash)
-                    .then_with(|| a.person.cmp(b.person))
-                    .then_with(|| a.ts.cmp(&b.ts))
-            });
+            p_events.sort_unstable_by_key(|e| (e.person_id, e.ts));
 
             let total_clicks: usize = click_person_shards.iter().map(|s| s[p_shard].len()).sum();
             let mut p_clicks = Vec::with_capacity(total_clicks);
@@ -870,9 +912,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
 
             p_clicks.sort_unstable_by(|a, b| {
-                a.person_hash
-                    .cmp(&b.person_hash)
-                    .then_with(|| a.person.cmp(b.person))
+                a.person_id
+                    .cmp(&b.person_id)
                     .then_with(|| a.ts.cmp(&b.ts))
                     .then_with(|| a.cid.cmp(b.cid))
             });
@@ -905,22 +946,19 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             let mut p_start = 0;
             while p_start < p_events.len() {
-                let p_hash = p_events[p_start].person_hash;
-                let p_name = p_events[p_start].person;
+                let person_id = p_events[p_start].person_id;
+                let p_name = person_names_ref[person_id as usize].as_ref();
 
                 let mut p_end = p_start + 1;
-                while p_end < p_events.len()
-                    && p_events[p_end].person_hash == p_hash
-                    && p_events[p_end].person == p_name
-                {
+                while p_end < p_events.len() && p_events[p_end].person_id == person_id {
                     p_end += 1;
                 }
 
                 let person_events = &p_events[p_start..p_end];
                 p_start = p_end;
 
-                let c_start = clicks_slice.partition_point(|c| (c.person_hash, c.person) < (p_hash, p_name));
-                let c_end = clicks_slice.partition_point(|c| (c.person_hash, c.person) <= (p_hash, p_name));
+                let c_start = clicks_slice.partition_point(|c| c.person_id < person_id);
+                let c_end = clicks_slice.partition_point(|c| c.person_id <= person_id);
                 let person_clicks = &clicks_slice[c_start..c_end];
 
                 for &d_idx in &used_days {
