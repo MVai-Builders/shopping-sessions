@@ -331,17 +331,24 @@ impl Dsu {
     }
 
     fn find(&mut self, x: &[u8]) -> Vec<u8> {
-        if let Some(p) = self.parent.get(x) {
-            if p.as_slice() == x {
-                return p.clone();
+        let mut curr = x;
+        while let Some(p) = self.parent.get(curr) {
+            if p.as_slice() == curr {
+                break;
             }
-            let p_clone = p.clone();
-            let root = self.find(&p_clone);
-            self.parent.insert(x.to_vec(), root.clone());
-            root
-        } else {
-            x.to_vec()
+            curr = p.as_slice();
         }
+        let root = curr.to_vec();
+        let mut curr_node = x.to_vec();
+        while let Some(p) = self.parent.get(&curr_node) {
+            if p.as_slice() == &root {
+                break;
+            }
+            let next_node = p.clone();
+            self.parent.insert(curr_node, root.clone());
+            curr_node = next_node;
+        }
+        root
     }
 
     fn union(&mut self, a: &[u8], b: &[u8]) {
@@ -417,21 +424,31 @@ struct Manifest {
 
 const NUM_EVENT_SHARDS: usize = 64;
 const NUM_PERSON_SHARDS: usize = 64;
+const MAX_CATEGORIES: usize = 64;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Ok(ncpu_str) = env::var("NCPU") {
+        if let Ok(ncpu) = ncpu_str.parse::<usize>() {
+            let _ = rayon::ThreadPoolBuilder::new().num_threads(ncpu).build_global();
+        }
+    }
+
     let args: Vec<String> = env::args().collect();
     let (data_dir, output_dir) = if args.len() >= 3 {
         (args[1].clone(), args[2].clone())
     } else {
-        ("/data".to_string(), "/output".to_string())
+        (
+            env::var("DATA_DIR").unwrap_or_else(|_| "/data".to_string()),
+            env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".to_string()),
+        )
     };
 
     let manifest_path = Path::new(&data_dir).join("manifest.json");
     let manifest_content = fs::read_to_string(manifest_path)?;
     let manifest: Manifest = serde_json::from_str(&manifest_content)?;
 
-    let w_start = parse_iso_f1(manifest.window_start.as_bytes()).expect("valid window_start");
-    let w_end = parse_iso_f1(manifest.window_end.as_bytes()).expect("valid window_end");
+    let w_start = parse_timestamp(manifest.window_start.as_bytes()).expect("valid window_start");
+    let w_end = parse_timestamp(manifest.window_end.as_bytes()).expect("valid window_end");
     let click_w_start = w_start - 7 * 86400 * 1000;
 
     let w_start_day = w_start.div_euclid(86_400_000) as i32;
@@ -466,6 +483,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
     }
+    assert!(cat_names.len() <= MAX_CATEGORIES, "categories exceed MAX_CATEGORIES");
+    let n_cats = cat_names.len();
 
     // 2. Campaigns
     let mut campaign_names: Vec<(String, String)> = Vec::with_capacity(4096);
@@ -530,13 +549,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .collect();
     event_files.sort();
 
-    let mmaps: Vec<Mmap> = event_files
-        .iter()
-        .map(|ef| {
-            let file = File::open(ef).expect("open event file");
-            unsafe { Mmap::map(&file).expect("mmap event file") }
-        })
-        .collect();
+    let mut mmaps: Vec<Mmap> = Vec::with_capacity(event_files.len());
+    for ef in &event_files {
+        let file = File::open(ef)?;
+        if file.metadata()?.len() > 0 {
+            mmaps.push(unsafe { Mmap::map(&file)? });
+        }
+    }
 
     let thread_event_shards: Vec<Vec<Vec<RawEvent>>> = mmaps
         .par_iter()
@@ -696,6 +715,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             person_bins
         })
         .collect();
+    drop(thread_event_shards);
 
     // 5. Clicks: PARALLEL SCAN & DEDUP DIRECTLY INTO PERSON BINS
     let clicks_pattern = format!("{}/clicks/*.csv", data_dir);
@@ -704,13 +724,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .collect();
     click_files.sort();
 
-    let click_mmaps: Vec<Mmap> = click_files
-        .iter()
-        .map(|cf| {
-            let file = File::open(cf).expect("open click file");
-            unsafe { Mmap::map(&file).expect("mmap click file") }
-        })
-        .collect();
+    let mut click_mmaps: Vec<Mmap> = Vec::with_capacity(click_files.len());
+    for cf in &click_files {
+        let file = File::open(cf)?;
+        if file.metadata()?.len() > 0 {
+            click_mmaps.push(unsafe { Mmap::map(&file)? });
+        }
+    }
 
     let thread_click_shards: Vec<Vec<Vec<RawClick>>> = click_mmaps
         .par_iter()
@@ -826,6 +846,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             person_bins
         })
         .collect();
+    drop(thread_click_shards);
 
     // 6. PARALLEL SESSIONIZE ACROSS ALL PERSON SHARDS WITH ZERO-HASHMAP FLAT ARRAYS
     const THIRTY_MIN_MS: i64 = 1_800_000;
@@ -889,7 +910,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 sessions: i64,
                 events: i64,
                 revenue: i64,
-                cat_rev: [i64; 32],
+                cat_rev: [i64; MAX_CATEGORIES],
             }
             let mut person_daily_arr: Vec<Option<PersonDayAgg>> = (0..n_days.max(1)).map(|_| None).collect();
             let mut used_days: Vec<usize> = Vec::with_capacity(n_days.min(64));
@@ -899,7 +920,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 events: i64,
                 revenue: i64,
                 purchases: i64,
-                cat_rev: [i64; 32],
+                cat_rev: [i64; MAX_CATEGORIES],
             }
             let mut sessions: Vec<LocalSession> = Vec::with_capacity(64);
 
@@ -935,7 +956,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let mut s_events = 0i64;
                 let mut s_revenue = 0i64;
                 let mut s_purchases = 0i64;
-                let mut s_cat_rev = [0i64; 32];
+                let mut s_cat_rev = [0i64; MAX_CATEGORIES];
 
                 for ev in person_events {
                     if (ev.ts - s_prev_ts) > THIRTY_MIN_MS {
@@ -950,7 +971,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         s_events = 0;
                         s_revenue = 0;
                         s_purchases = 0;
-                        s_cat_rev = [0; 32];
+                        s_cat_rev = [0; MAX_CATEGORIES];
                     }
                     s_prev_ts = ev.ts;
                     s_events += 1;
@@ -984,7 +1005,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 sessions: 0,
                                 events: 0,
                                 revenue: 0,
-                                cat_rev: [0; 32],
+                                cat_rev: [0; MAX_CATEGORIES],
                             });
                             used_days.push(d_idx);
                         }
@@ -992,7 +1013,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         pd.sessions += 1;
                         pd.events += sess.events;
                         pd.revenue += sess.revenue;
-                        for i in 0..32 {
+                        for i in 0..n_cats {
                             pd.cat_rev[i] += sess.cat_rev[i];
                         }
                     }
@@ -1066,7 +1087,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let pd = person_daily_arr[d_idx].as_ref().unwrap();
                     let day_epoch = w_start_day + d_idx as i32;
                     let mut best_cat_idx: Option<usize> = None;
-                    for i in 0..32 {
+                    for i in 0..n_cats {
                         let amt = pd.cat_rev[i];
                         if amt > 0 {
                             if let Some(b) = best_cat_idx {

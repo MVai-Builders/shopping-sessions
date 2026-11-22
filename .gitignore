@@ -1,1 +1,10 @@
 target/
+dev-answer/
+generator/
+starter-*/
+*.zip
+rules.md
+dev/
+out/
+*.parquet
+*.csv
