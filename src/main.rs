@@ -187,7 +187,7 @@ fn unquote_field(mut s: &[u8]) -> Option<&[u8]> {
         }
         s = &s[1..s.len() - 1];
     }
-    if s.contains(&b'\"') {
+    if s.contains(&b'"') {
         return None;
     }
     Some(s)
@@ -359,6 +359,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let w_end = parse_iso_f1(manifest.window_end.as_bytes()).expect("valid window_end");
     let click_w_start = w_start - 7 * 86400 * 1000;
 
+    // Window day range for fixed-array person_daily
+    let w_start_day = w_start.div_euclid(86_400_000) as i32;
+    let w_end_day = (w_end - 1).div_euclid(86_400_000) as i32;
+    let n_days = (w_end_day - w_start_day + 1) as usize;
+
     // 1. Categories & Products
     let mut cat_names: Vec<String> = Vec::with_capacity(32);
     cat_names.push("unknown".to_string());
@@ -413,6 +418,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+
+    let n_campaigns = campaign_names.len(); // includes organic at index 0
 
     // 3. User IDs & Links DSU
     let mut dsu = Dsu::new();
@@ -548,17 +555,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 locs.extend_from_slice(&ts[shard_idx]);
             }
 
-            // In-place sort by (eid_hash, eid_bytes, ingest_ms)
+            // In-place sort by (eid_hash, ingest_ms) — hash collisions are negligible at 2^-64
             locs.sort_unstable_by(|a, b| {
-                a.eid_hash.cmp(&b.eid_hash).then_with(|| {
-                    let line_a = &mmaps_ref[a.file_idx as usize][a.line_offset as usize..(a.line_offset + a.line_len) as usize];
-                    let line_b = &mmaps_ref[b.file_idx as usize][b.line_offset as usize..(b.line_offset + b.line_len) as usize];
-                    let mut cols_a = [b"".as_slice(); 7];
-                    let mut cols_b = [b"".as_slice(); 7];
-                    parse_line_7(line_a, &mut cols_a);
-                    parse_line_7(line_b, &mut cols_b);
-                    cols_a[0].cmp(cols_b[0]).then_with(|| a.ingest_ms.cmp(&b.ingest_ms))
-                })
+                a.eid_hash
+                    .cmp(&b.eid_hash)
+                    .then_with(|| a.ingest_ms.cmp(&b.ingest_ms))
             });
 
             let mut valid = Vec::with_capacity(locs.len());
@@ -749,17 +750,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         all_raw_clicks.extend(fc);
     }
 
-    all_raw_clicks.par_sort_unstable_by(|a, b| {
-        a.cid_hash.cmp(&b.cid_hash).then_with(|| {
-            let line_a = &click_mmaps[a.f_idx as usize][a.line_offset as usize..(a.line_offset + a.line_len) as usize];
-            let line_b = &click_mmaps[b.f_idx as usize][b.line_offset as usize..(b.line_offset + b.line_len) as usize];
-            let mut cols_a = [b"".as_slice(); 4];
-            let mut cols_b = [b"".as_slice(); 4];
-            parse_line_4(line_a, &mut cols_a);
-            parse_line_4(line_b, &mut cols_b);
-            cols_a[0].cmp(cols_b[0])
-        })
-    });
+    // Sort by cid_hash only for dedup
+    all_raw_clicks.par_sort_unstable_by(|a, b| a.cid_hash.cmp(&b.cid_hash));
 
     let mut valid_clicks: Vec<FastClick> = Vec::with_capacity(all_raw_clicks.len());
     let mut c_idx = 0;
@@ -806,6 +798,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Sort clicks by (person_hash, person, ts, cid) for sessionization
     valid_clicks.par_sort_unstable_by(|a, b| {
         a.person_hash
             .cmp(&b.person_hash)
@@ -833,13 +826,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         purchasing_sessions: i64,
         revenue: i64,
         assisted_sessions: i64,
-    }
-
-    struct PersonDayAgg {
-        sessions: i64,
-        events: i64,
-        revenue: i64,
-        cat_rev: [i64; 32],
     }
 
     let n_threads = rayon::current_num_threads();
@@ -875,6 +861,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut user_records = Vec::with_capacity(t_events.len() / 15);
             let mut camp_map: HashMap<(u32, i32), CampaignDailyEntry> = HashMap::with_capacity(16384);
 
+            // Per-thread reusable bitmask for O(1) assist-seen lookup
+            // Size = n_campaigns (includes organic at 0)
+            let mut assist_seen: Vec<bool> = vec![false; n_campaigns];
+            // Track which indices were dirtied so we can reset cheaply
+            let mut dirty_camps: Vec<u32> = Vec::with_capacity(64);
+
+            // Per-thread reusable fixed-array for person_daily indexed by (day - w_start_day)
+            // Use Option<PersonDayAgg> per slot; we clear only used slots
+            struct PersonDayAgg {
+                sessions: i64,
+                events: i64,
+                revenue: i64,
+                cat_rev: [i64; 32],
+            }
+            let mut person_daily_arr: Vec<Option<PersonDayAgg>> = (0..n_days.max(1)).map(|_| None).collect();
+            // Track which day slots are used so we can clear only them
+            let mut used_days: Vec<usize> = Vec::with_capacity(n_days.min(64));
+
             let mut p_start = 0;
             while p_start < t_events.len() {
                 let p_hash = t_events[p_start].person_hash;
@@ -891,12 +895,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let person_events = &t_events[p_start..p_end];
                 p_start = p_end;
 
+                // Binary-search to find this person's click range
                 let c_start = clicks_slice.partition_point(|c| (c.person_hash, c.person) < (p_hash, p_name));
                 let c_end = clicks_slice.partition_point(|c| (c.person_hash, c.person) <= (p_hash, p_name));
                 let person_clicks = &clicks_slice[c_start..c_end];
 
-                let mut person_daily: HashMap<i32, PersonDayAgg> = HashMap::with_capacity(16);
+                // Reset used_days from previous person
+                for &d_idx in &used_days {
+                    person_daily_arr[d_idx] = None;
+                }
+                used_days.clear();
 
+                // Sessionize
                 let mut sess_start_ts = person_events[0].ts;
                 let mut sess_prev_ts = person_events[0].ts;
                 let mut sess_events = 0i64;
@@ -904,38 +914,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut sess_purchases = 0i64;
                 let mut sess_cat_rev = [0i64; 32];
 
-                let process_session = |s_start_ts: i64,
-                                           s_evs: i64,
-                                           s_rev: i64,
-                                           s_purchases: i64,
-                                           s_cat_rev: [i64; 32],
-                                           p_daily: &mut HashMap<i32, PersonDayAgg>,
-                                           c_map: &mut HashMap<(u32, i32), CampaignDailyEntry>| {
-                    let day_epoch = (s_start_ts.div_euclid(86_400_000)) as i32;
+                // Macro-like inline session processor to avoid closure capture overhead
+                macro_rules! flush_session {
+                    () => {{
+                        let s_start_ts = sess_start_ts;
+                        let day_epoch = s_start_ts.div_euclid(86_400_000) as i32;
+                        let d_idx = (day_epoch - w_start_day) as usize;
 
-                    let pd = p_daily.entry(day_epoch).or_insert_with(|| PersonDayAgg {
-                        sessions: 0,
-                        events: 0,
-                        revenue: 0,
-                        cat_rev: [0; 32],
-                    });
-                    pd.sessions += 1;
-                    pd.events += s_evs;
-                    pd.revenue += s_rev;
-                    for i in 0..32 {
-                        pd.cat_rev[i] += s_cat_rev[i];
-                    }
-
-                    let mut best_click: Option<(i64, &[u8], u32)> = None;
-                    let mut assisting_camps: Vec<u32> = Vec::with_capacity(8);
-
-                    for c in person_clicks {
-                        if c.ts > s_start_ts {
-                            break;
+                        // Update person daily (fixed array, no alloc)
+                        if d_idx < person_daily_arr.len() {
+                            if person_daily_arr[d_idx].is_none() {
+                                person_daily_arr[d_idx] = Some(PersonDayAgg {
+                                    sessions: 0,
+                                    events: 0,
+                                    revenue: 0,
+                                    cat_rev: [0; 32],
+                                });
+                                used_days.push(d_idx);
+                            }
+                            let pd = person_daily_arr[d_idx].as_mut().unwrap();
+                            pd.sessions += 1;
+                            pd.events += sess_events;
+                            pd.revenue += sess_revenue;
+                            for i in 0..32 {
+                                pd.cat_rev[i] += sess_cat_rev[i];
+                            }
                         }
-                        if (s_start_ts - c.ts) <= SEVEN_DAYS_MS {
-                            if !assisting_camps.contains(&c.camp_id) {
-                                assisting_camps.push(c.camp_id);
+
+                        // Find best click and assisting campaigns
+                        // Binary-search for window start: s_start_ts - 7 days
+                        let win_start = s_start_ts - SEVEN_DAYS_MS;
+                        let lo = person_clicks.partition_point(|c| c.ts < win_start);
+
+                        dirty_camps.clear();
+                        let mut best_click: Option<(i64, &[u8], u32)> = None;
+
+                        for c in &person_clicks[lo..] {
+                            if c.ts > s_start_ts {
+                                break;
+                            }
+                            // c.ts is in [win_start, s_start_ts]
+                            let cid_usize = c.camp_id as usize;
+                            if cid_usize < assist_seen.len() && !assist_seen[cid_usize] {
+                                assist_seen[cid_usize] = true;
+                                dirty_camps.push(c.camp_id);
                             }
                             if let Some(best) = &mut best_click {
                                 if c.ts > best.0 {
@@ -947,43 +969,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 best_click = Some((c.ts, c.cid, c.camp_id));
                             }
                         }
-                    }
 
-                    let credited_camp_id = best_click.map(|b| b.2).unwrap_or(ORGANIC_CAMP_ID);
-                    let cd = c_map.entry((credited_camp_id, day_epoch)).or_insert_with(|| CampaignDailyEntry {
-                        sessions: 0,
-                        purchasing_sessions: 0,
-                        revenue: 0,
-                        assisted_sessions: 0,
-                    });
-                    cd.sessions += 1;
-                    if s_purchases > 0 {
-                        cd.purchasing_sessions += 1;
-                    }
-                    cd.revenue += s_rev;
-
-                    for &camp_id in &assisting_camps {
-                        let ac = c_map.entry((camp_id, day_epoch)).or_insert_with(|| CampaignDailyEntry {
+                        let credited_camp_id = best_click.map(|b| b.2).unwrap_or(ORGANIC_CAMP_ID);
+                        let cd = camp_map.entry((credited_camp_id, day_epoch)).or_insert_with(|| CampaignDailyEntry {
                             sessions: 0,
                             purchasing_sessions: 0,
                             revenue: 0,
                             assisted_sessions: 0,
                         });
-                        ac.assisted_sessions += 1;
-                    }
-                };
+                        cd.sessions += 1;
+                        if sess_purchases > 0 {
+                            cd.purchasing_sessions += 1;
+                        }
+                        cd.revenue += sess_revenue;
+
+                        for &camp_id in &dirty_camps {
+                            let ac = camp_map.entry((camp_id, day_epoch)).or_insert_with(|| CampaignDailyEntry {
+                                sessions: 0,
+                                purchasing_sessions: 0,
+                                revenue: 0,
+                                assisted_sessions: 0,
+                            });
+                            ac.assisted_sessions += 1;
+                        }
+
+                        // Reset assist_seen bitmask (only dirty slots)
+                        for &id in &dirty_camps {
+                            assist_seen[id as usize] = false;
+                        }
+                    }};
+                }
 
                 for ev in person_events {
                     if (ev.ts - sess_prev_ts) > THIRTY_MIN_MS {
-                        process_session(
-                            sess_start_ts,
-                            sess_events,
-                            sess_revenue,
-                            sess_purchases,
-                            sess_cat_rev,
-                            &mut person_daily,
-                            &mut camp_map,
-                        );
+                        flush_session!();
                         sess_start_ts = ev.ts;
                         sess_events = 0;
                         sess_revenue = 0;
@@ -998,17 +1017,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         sess_cat_rev[ev.category as usize] += ev.price_cents as i64;
                     }
                 }
-                process_session(
-                    sess_start_ts,
-                    sess_events,
-                    sess_revenue,
-                    sess_purchases,
-                    sess_cat_rev,
-                    &mut person_daily,
-                    &mut camp_map,
-                );
+                flush_session!();
 
-                for (day_epoch, pd) in person_daily {
+                // Collect person daily records
+                for &d_idx in &used_days {
+                    let pd = person_daily_arr[d_idx].as_ref().unwrap();
+                    let day_epoch = w_start_day + d_idx as i32;
                     let mut best_cat_idx: Option<usize> = None;
                     for i in 0..32 {
                         let amt = pd.cat_rev[i];
@@ -1016,10 +1030,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(b) = best_cat_idx {
                                 if amt > pd.cat_rev[b] {
                                     best_cat_idx = Some(i);
-                                } else if amt == pd.cat_rev[b] {
-                                    if cat_names_ref[i] < cat_names_ref[b] {
-                                        best_cat_idx = Some(i);
-                                    }
+                                } else if amt == pd.cat_rev[b] && cat_names_ref[i] < cat_names_ref[b] {
+                                    best_cat_idx = Some(i);
                                 }
                             } else {
                                 best_cat_idx = Some(i);
