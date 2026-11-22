@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, Date32Array, Int64Array, RecordBatch, StringArray,
+    ArrayRef, Date32Array, Int64Array, RecordBatch, StringBuilder,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use hashbrown::HashMap;
@@ -14,7 +14,7 @@ use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
 use serde::Deserialize;
 
-// ─── Fast Date & Civil Math ──────────────────────────────────────────────────
+// ─── Fast Date & Civil Math (Branchless Digits) ──────────────────────────────
 
 #[inline(always)]
 fn is_leap(y: i64) -> bool {
@@ -33,54 +33,42 @@ fn days_from_civil(mut y: i64, m: i64, d: i64) -> i32 {
 }
 
 #[inline(always)]
-fn parse_2_digits(s: &[u8]) -> Option<i64> {
-    if s.len() != 2 || !s[0].is_ascii_digit() || !s[1].is_ascii_digit() {
-        return None;
-    }
-    Some((s[0] - b'0') as i64 * 10 + (s[1] - b'0') as i64)
-}
-
-#[inline(always)]
-fn parse_4_digits(s: &[u8]) -> Option<i64> {
-    if s.len() != 4
-        || !s[0].is_ascii_digit()
-        || !s[1].is_ascii_digit()
-        || !s[2].is_ascii_digit()
-        || !s[3].is_ascii_digit()
-    {
-        return None;
-    }
-    Some(
-        (s[0] - b'0') as i64 * 1000
-            + (s[1] - b'0') as i64 * 100
-            + (s[2] - b'0') as i64 * 10
-            + (s[3] - b'0') as i64,
-    )
-}
-
-#[inline(always)]
 fn parse_iso_f1(s: &[u8]) -> Option<i64> {
     if s.len() != 20
-        || s[10] != b'T'
-        || s[19] != b'Z'
         || s[4] != b'-'
         || s[7] != b'-'
+        || s[10] != b'T'
         || s[13] != b':'
         || s[16] != b':'
+        || s[19] != b'Z'
     {
         return None;
     }
-    for &idx in &[0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18] {
-        if !s[idx].is_ascii_digit() {
-            return None;
-        }
+    let y0 = s[0].wrapping_sub(b'0');
+    let y1 = s[1].wrapping_sub(b'0');
+    let y2 = s[2].wrapping_sub(b'0');
+    let y3 = s[3].wrapping_sub(b'0');
+    let m0 = s[5].wrapping_sub(b'0');
+    let m1 = s[6].wrapping_sub(b'0');
+    let d0 = s[8].wrapping_sub(b'0');
+    let d1 = s[9].wrapping_sub(b'0');
+    let h0 = s[11].wrapping_sub(b'0');
+    let h1 = s[12].wrapping_sub(b'0');
+    let mi0 = s[14].wrapping_sub(b'0');
+    let mi1 = s[15].wrapping_sub(b'0');
+    let se0 = s[17].wrapping_sub(b'0');
+    let se1 = s[18].wrapping_sub(b'0');
+
+    if (y0 | y1 | y2 | y3 | m0 | m1 | d0 | d1 | h0 | h1 | mi0 | mi1 | se0 | se1) > 9 {
+        return None;
     }
-    let y = parse_4_digits(&s[0..4])?;
-    let m = parse_2_digits(&s[5..7])?;
-    let d = parse_2_digits(&s[8..10])?;
-    let h = parse_2_digits(&s[11..13])?;
-    let mi = parse_2_digits(&s[14..16])?;
-    let se = parse_2_digits(&s[17..19])?;
+
+    let y = y0 as i64 * 1000 + y1 as i64 * 100 + y2 as i64 * 10 + y3 as i64;
+    let m = m0 as i64 * 10 + m1 as i64;
+    let d = d0 as i64 * 10 + d1 as i64;
+    let h = h0 as i64 * 10 + h1 as i64;
+    let mi = mi0 as i64 * 10 + mi1 as i64;
+    let se = se0 as i64 * 10 + se1 as i64;
 
     if !(1..=12).contains(&m) || !(0..=23).contains(&h) || !(0..=59).contains(&mi) || !(0..=59).contains(&se) {
         return None;
@@ -96,9 +84,9 @@ fn parse_iso_f1(s: &[u8]) -> Option<i64> {
 #[inline(always)]
 fn parse_iso_f2(s: &[u8]) -> Option<i64> {
     if s.len() != 25
-        || s[10] != b'T'
         || s[4] != b'-'
         || s[7] != b'-'
+        || s[10] != b'T'
         || s[13] != b':'
         || s[16] != b':'
         || s[22] != b':'
@@ -109,19 +97,36 @@ fn parse_iso_f2(s: &[u8]) -> Option<i64> {
     if sign != b'+' && sign != b'-' {
         return None;
     }
-    for &idx in &[0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 23, 24] {
-        if !s[idx].is_ascii_digit() {
-            return None;
-        }
+    let y0 = s[0].wrapping_sub(b'0');
+    let y1 = s[1].wrapping_sub(b'0');
+    let y2 = s[2].wrapping_sub(b'0');
+    let y3 = s[3].wrapping_sub(b'0');
+    let m0 = s[5].wrapping_sub(b'0');
+    let m1 = s[6].wrapping_sub(b'0');
+    let d0 = s[8].wrapping_sub(b'0');
+    let d1 = s[9].wrapping_sub(b'0');
+    let h0 = s[11].wrapping_sub(b'0');
+    let h1 = s[12].wrapping_sub(b'0');
+    let mi0 = s[14].wrapping_sub(b'0');
+    let mi1 = s[15].wrapping_sub(b'0');
+    let se0 = s[17].wrapping_sub(b'0');
+    let se1 = s[18].wrapping_sub(b'0');
+    let oh0 = s[20].wrapping_sub(b'0');
+    let oh1 = s[21].wrapping_sub(b'0');
+    let omi0 = s[23].wrapping_sub(b'0');
+    let omi1 = s[24].wrapping_sub(b'0');
+
+    if (y0 | y1 | y2 | y3 | m0 | m1 | d0 | d1 | h0 | h1 | mi0 | mi1 | se0 | se1 | oh0 | oh1 | omi0 | omi1) > 9 {
+        return None;
     }
-    let y = parse_4_digits(&s[0..4])?;
-    let m = parse_2_digits(&s[5..7])?;
-    let d = parse_2_digits(&s[8..10])?;
-    let h = parse_2_digits(&s[11..13])?;
-    let mi = parse_2_digits(&s[14..16])?;
-    let se = parse_2_digits(&s[17..19])?;
-    let oh = parse_2_digits(&s[20..22])?;
-    let omi = parse_2_digits(&s[23..25])?;
+    let y = y0 as i64 * 1000 + y1 as i64 * 100 + y2 as i64 * 10 + y3 as i64;
+    let m = m0 as i64 * 10 + m1 as i64;
+    let d = d0 as i64 * 10 + d1 as i64;
+    let h = h0 as i64 * 10 + h1 as i64;
+    let mi = mi0 as i64 * 10 + mi1 as i64;
+    let se = se0 as i64 * 10 + se1 as i64;
+    let oh = oh0 as i64 * 10 + oh1 as i64;
+    let omi = omi0 as i64 * 10 + omi1 as i64;
 
     if !(1..=12).contains(&m)
         || !(0..=23).contains(&h)
@@ -165,7 +170,7 @@ fn parse_timestamp(s: &[u8]) -> Option<i64> {
     None
 }
 
-// ─── Deterministic FNV-1a Hash ───────────────────────────────────────────────
+// ─── Fast Deterministic FNV-1a Hash ──────────────────────────────────────────
 
 #[inline(always)]
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -187,7 +192,7 @@ fn unquote_field(mut s: &[u8]) -> Option<&[u8]> {
         }
         s = &s[1..s.len() - 1];
     }
-    if s.contains(&b'"') {
+    if memchr::memchr(b'"', s).is_some() {
         return None;
     }
     Some(s)
@@ -487,7 +492,6 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         })
         .collect();
 
-    // Phase 4a: Fast parallel scan of all event files into 64 shards
     let thread_event_shards: Vec<Vec<Vec<RawEvent>>> = mmaps
         .par_iter()
         .map(|mmap| {
@@ -552,7 +556,6 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         })
         .collect();
 
-    // Phase 4b: Deduplicate & validate events, partition into NUM_PERSON_SHARDS
     let products_ref = &products;
     let resolved_links_ref = &resolved_links;
 
@@ -565,7 +568,6 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 items.extend_from_slice(&ts[shard_idx]);
             }
 
-            // In-place sort by (eid_hash, eid, ingest_ms)
             items.sort_unstable_by(|a, b| {
                 a.eid_hash
                     .cmp(&b.eid_hash)
@@ -586,7 +588,6 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
                 i = j;
 
-                // Validate the kept copy
                 let uid = best.uid;
                 let pid = best.pid;
                 if uid.is_empty() || pid.is_empty() {
@@ -728,7 +729,6 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 items.extend_from_slice(&ts[shard_idx]);
             }
 
-            // Dedup on (cid_hash, cid)
             items.sort_unstable_by(|a, b| {
                 a.cid_hash.cmp(&b.cid_hash).then_with(|| a.cid.cmp(b.cid))
             });
@@ -817,7 +817,6 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 p_events.extend_from_slice(&s[p_shard]);
             }
 
-            // In-place sort by (person_hash, person, ts)
             p_events.sort_unstable_by(|a, b| {
                 a.person_hash
                     .cmp(&b.person_hash)
@@ -831,7 +830,6 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 p_clicks.extend_from_slice(&s[p_shard]);
             }
 
-            // In-place sort by (person_hash, person, ts, cid)
             p_clicks.sort_unstable_by(|a, b| {
                 a.person_hash
                     .cmp(&b.person_hash)
@@ -1019,30 +1017,35 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         })
         .collect();
 
-    // 7. PARQUET OUTPUT GENERATION (PARALLEL WRITE)
+    // 7. PARQUET OUTPUT GENERATION (ZERO-ALLOC STRINGBUILDER + PARALLEL WRITE)
     let u_dir = Path::new(&output_dir).join("user_daily");
     fs::create_dir_all(&u_dir)?;
     let c_dir = Path::new(&output_dir).join("campaign_daily");
     fs::create_dir_all(&c_dir)?;
 
     let total_user_rows: usize = shard_results.iter().map(|(ur, _)| ur.len()).sum();
-    let mut u_ids: Vec<String> = Vec::with_capacity(total_user_rows);
+    let mut u_ids_b = StringBuilder::with_capacity(total_user_rows, total_user_rows * 12);
+    let mut u_top_cat_b = StringBuilder::with_capacity(total_user_rows, total_user_rows * 10);
     let mut u_days: Vec<i32> = Vec::with_capacity(total_user_rows);
     let mut u_sessions: Vec<i64> = Vec::with_capacity(total_user_rows);
     let mut u_events: Vec<i64> = Vec::with_capacity(total_user_rows);
     let mut u_rev: Vec<i64> = Vec::with_capacity(total_user_rows);
-    let mut u_top_cat: Vec<Option<String>> = Vec::with_capacity(total_user_rows);
 
     let mut merged_campaign_daily: HashMap<(u32, i32), CampaignDailyEntry> = HashMap::with_capacity(32768);
 
     for (ur, cm) in shard_results {
         for r in ur {
-            u_ids.push(String::from_utf8_lossy(r.person).to_string());
+            let s = unsafe { std::str::from_utf8_unchecked(r.person) };
+            u_ids_b.append_value(s);
             u_days.push(r.day);
             u_sessions.push(r.sessions);
             u_events.push(r.events);
             u_rev.push(r.revenue);
-            u_top_cat.push(r.top_category.map(|idx| cat_names[idx as usize].clone()));
+            if let Some(idx) = r.top_category {
+                u_top_cat_b.append_value(&cat_names[idx as usize]);
+            } else {
+                u_top_cat_b.append_null();
+            }
         }
         for (k, v) in cm {
             let entry = merged_campaign_daily.entry(k).or_insert_with(|| CampaignDailyEntry {
@@ -1058,26 +1061,32 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
-    let mut c_ids: Vec<String> = Vec::with_capacity(merged_campaign_daily.len());
-    let mut c_channels: Vec<String> = Vec::with_capacity(merged_campaign_daily.len());
-    let mut c_days: Vec<i32> = Vec::with_capacity(merged_campaign_daily.len());
-    let mut c_sessions: Vec<i64> = Vec::with_capacity(merged_campaign_daily.len());
-    let mut c_purchasing: Vec<i64> = Vec::with_capacity(merged_campaign_daily.len());
-    let mut c_rev: Vec<i64> = Vec::with_capacity(merged_campaign_daily.len());
-    let mut c_assisted: Vec<i64> = Vec::with_capacity(merged_campaign_daily.len());
+    let n_camp_rows = merged_campaign_daily.len();
+    let mut c_ids_b = StringBuilder::with_capacity(n_camp_rows, n_camp_rows * 8);
+    let mut c_channels_b = StringBuilder::with_capacity(n_camp_rows, n_camp_rows * 10);
+    let mut c_days: Vec<i32> = Vec::with_capacity(n_camp_rows);
+    let mut c_sessions: Vec<i64> = Vec::with_capacity(n_camp_rows);
+    let mut c_purchasing: Vec<i64> = Vec::with_capacity(n_camp_rows);
+    let mut c_rev: Vec<i64> = Vec::with_capacity(n_camp_rows);
+    let mut c_assisted: Vec<i64> = Vec::with_capacity(n_camp_rows);
 
-    for ((camp_id, day_epoch), data) in merged_campaign_daily {
-        let (cid_str, ch_str) = &campaign_names[camp_id as usize];
-        c_ids.push(cid_str.clone());
-        c_channels.push(ch_str.clone());
-        c_days.push(day_epoch);
+    for ((camp_id, day_epoch), data) in &merged_campaign_daily {
+        let (cid_str, ch_str) = &campaign_names[*camp_id as usize];
+        c_ids_b.append_value(cid_str);
+        c_channels_b.append_value(ch_str);
+        c_days.push(*day_epoch);
         c_sessions.push(data.sessions);
         c_purchasing.push(data.purchasing_sessions);
         c_rev.push(data.revenue);
         c_assisted.push(data.assisted_sessions);
     }
 
-    let write_user_parquet = || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let u_ids_array = Arc::new(u_ids_b.finish()) as ArrayRef;
+    let u_top_cat_array = Arc::new(u_top_cat_b.finish()) as ArrayRef;
+    let c_ids_array = Arc::new(c_ids_b.finish()) as ArrayRef;
+    let c_channels_array = Arc::new(c_channels_b.finish()) as ArrayRef;
+
+    let write_user_parquet = move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let u_schema = Arc::new(Schema::new(vec![
             Field::new("user_id", DataType::Utf8, false),
             Field::new("day", DataType::Date32, false),
@@ -1090,24 +1099,26 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let u_batch = RecordBatch::try_new(
             u_schema.clone(),
             vec![
-                Arc::new(StringArray::from(u_ids)) as ArrayRef,
+                u_ids_array,
                 Arc::new(Date32Array::from(u_days)) as ArrayRef,
                 Arc::new(Int64Array::from(u_sessions)) as ArrayRef,
                 Arc::new(Int64Array::from(u_events)) as ArrayRef,
                 Arc::new(Int64Array::from(u_rev)) as ArrayRef,
-                Arc::new(StringArray::from(u_top_cat)) as ArrayRef,
+                u_top_cat_array,
             ],
         )?;
 
         let u_file = File::create(u_dir.join("part-0.parquet"))?;
-        let props = WriterProperties::builder().build();
+        let props = WriterProperties::builder()
+            .set_compression(parquet::basic::Compression::UNCOMPRESSED)
+            .build();
         let mut u_writer = ArrowWriter::try_new(u_file, u_schema, Some(props))?;
         u_writer.write(&u_batch)?;
         u_writer.close()?;
         Ok(())
     };
 
-    let write_camp_parquet = || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let write_camp_parquet = move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let c_schema = Arc::new(Schema::new(vec![
             Field::new("campaign_id", DataType::Utf8, false),
             Field::new("channel", DataType::Utf8, false),
@@ -1121,8 +1132,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let c_batch = RecordBatch::try_new(
             c_schema.clone(),
             vec![
-                Arc::new(StringArray::from(c_ids)) as ArrayRef,
-                Arc::new(StringArray::from(c_channels)) as ArrayRef,
+                c_ids_array,
+                c_channels_array,
                 Arc::new(Date32Array::from(c_days)) as ArrayRef,
                 Arc::new(Int64Array::from(c_sessions)) as ArrayRef,
                 Arc::new(Int64Array::from(c_purchasing)) as ArrayRef,
@@ -1132,7 +1143,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )?;
 
         let c_file = File::create(c_dir.join("part-0.parquet"))?;
-        let props = WriterProperties::builder().build();
+        let props = WriterProperties::builder()
+            .set_compression(parquet::basic::Compression::UNCOMPRESSED)
+            .build();
         let mut c_writer = ArrowWriter::try_new(c_file, c_schema, Some(props))?;
         c_writer.write(&c_batch)?;
         c_writer.close()?;
