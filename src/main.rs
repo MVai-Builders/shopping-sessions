@@ -181,19 +181,11 @@ fn fast_hash(bytes: &[u8]) -> u64 {
 
 // ─── Pass-Through Zero-Cost Hasher for Pre-Hashed Keys ─────────────────────────
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct ShardKey<'a> {
     hash: u64,
     bytes: &'a [u8],
 }
-
-impl<'a> PartialEq for ShardKey<'a> {
-    #[inline(always)]
-    fn eq(&self, other: &Self) -> bool {
-        self.hash == other.hash && self.bytes == other.bytes
-    }
-}
-impl<'a> Eq for ShardKey<'a> {}
 
 impl<'a> std::hash::Hash for ShardKey<'a> {
     #[inline(always)]
@@ -211,7 +203,11 @@ impl std::hash::Hasher for PassThroughHasher {
         self.0
     }
     #[inline(always)]
-    fn write(&mut self, _bytes: &[u8]) {}
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ (b as u64)).wrapping_mul(0x100000001b3);
+        }
+    }
     #[inline(always)]
     fn write_u64(&mut self, i: u64) {
         self.0 = i;
@@ -554,6 +550,33 @@ struct CampaignDailyEntry {
     assisted_sessions: i64,
 }
 
+#[derive(Clone, Copy)]
+struct LocalSession {
+    start_ts: i64,
+    events: i64,
+    revenue: i64,
+    purchases: i64,
+    cat_rev: [i64; MAX_CATEGORIES],
+}
+
+#[derive(Clone, Copy)]
+struct PersonDayAgg {
+    sessions: i64,
+    events: i64,
+    revenue: i64,
+    cat_rev: [i64; MAX_CATEGORIES],
+}
+
+#[derive(Clone, Copy)]
+struct UserDailyRecord<'a> {
+    person: &'a [u8],
+    day: i32,
+    sessions: i64,
+    events: i64,
+    revenue: i64,
+    top_category: Option<u8>,
+}
+
 // ─── Main Pipeline ───────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -703,13 +726,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let event_chunks = create_chunks(&mmaps, PARSE_CHUNK_SIZE);
 
-    let thread_event_shards: Vec<Vec<Vec<RawEvent>>> = event_chunks
+    let thread_event_shards = event_chunks
         .par_iter()
         .map(|chunk| {
             let bytes = chunk.data;
-            let mut shards: Vec<Vec<RawEvent>> = (0..NUM_EVENT_SHARDS)
+            let mut shards = (0..NUM_EVENT_SHARDS)
                 .map(|_| Vec::with_capacity(bytes.len() / (80 * NUM_EVENT_SHARDS) + 16))
-                .collect();
+                .collect::<Vec<_>>();
             let mut cols = [b"".as_slice(); 7];
             let mut start = 0;
             let mut is_first_line = chunk.is_first_chunk;
@@ -834,17 +857,16 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             shards
         })
-        .collect();
+        .collect::<Vec<_>>();
 
     let products_ref = &products;
     let resolved_links_ref = &resolved_links;
 
-    let event_person_shards: Vec<Vec<Vec<FastEvent>>> = (0..NUM_EVENT_SHARDS)
+    let event_person_shards = (0..NUM_EVENT_SHARDS)
         .into_par_iter()
         .map(|shard_idx| {
             let total_items: usize = thread_event_shards.iter().map(|ts| ts[shard_idx].len()).sum();
-            let mut dedup_map: HashMap<ShardKey<'a>, RawEvent<'a>, PassThroughBuildHasher> =
-                HashMap::with_capacity_and_hasher(total_items, PassThroughBuildHasher::default());
+            let mut dedup_map = HashMap::with_capacity_and_hasher(total_items, PassThroughBuildHasher::default());
 
             for ts in &thread_event_shards {
                 for ev in &ts[shard_idx] {
@@ -865,9 +887,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
 
-            let mut person_bins: Vec<Vec<FastEvent>> = (0..NUM_PERSON_SHARDS)
+            let mut person_bins = (0..NUM_PERSON_SHARDS)
                 .map(|_| Vec::with_capacity(dedup_map.len() / NUM_PERSON_SHARDS + 32))
-                .collect();
+                .collect::<Vec<_>>();
 
             for (_key, best) in dedup_map {
                 let uid = best.uid;
@@ -905,7 +927,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             person_bins
         })
-        .collect();
+        .collect::<Vec<_>>();
     drop(thread_event_shards);
 
     // 5. Clicks: PARALLEL WORK-STEALING CHUNK SCAN & DEDUP DIRECTLY INTO PERSON BINS
@@ -925,13 +947,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let click_chunks = create_chunks(&click_mmaps, PARSE_CHUNK_SIZE);
 
-    let thread_click_shards: Vec<Vec<Vec<RawClick>>> = click_chunks
+    let thread_click_shards = click_chunks
         .par_iter()
         .map(|chunk| {
             let bytes = chunk.data;
-            let mut shards: Vec<Vec<RawClick>> = (0..NUM_EVENT_SHARDS)
+            let mut shards = (0..NUM_EVENT_SHARDS)
                 .map(|_| Vec::with_capacity(bytes.len() / (60 * NUM_EVENT_SHARDS) + 16))
-                .collect();
+                .collect::<Vec<_>>();
             let mut cols = [b"".as_slice(); 4];
             let mut start = 0;
             let mut is_first_line = chunk.is_first_chunk;
@@ -980,18 +1002,17 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             shards
         })
-        .collect();
+        .collect::<Vec<_>>();
 
-    let click_person_shards: Vec<Vec<Vec<FastClick>>> = (0..NUM_EVENT_SHARDS)
+    let click_person_shards = (0..NUM_EVENT_SHARDS)
         .into_par_iter()
         .map(|shard_idx| {
             let total_items: usize = thread_click_shards.iter().map(|ts| ts[shard_idx].len()).sum();
-            let mut seen: hashbrown::HashSet<ShardKey<'a>, PassThroughBuildHasher> =
-                hashbrown::HashSet::with_capacity_and_hasher(total_items, PassThroughBuildHasher::default());
+            let mut seen = hashbrown::HashSet::with_capacity_and_hasher(total_items, PassThroughBuildHasher::default());
 
-            let mut person_bins: Vec<Vec<FastClick>> = (0..NUM_PERSON_SHARDS)
+            let mut person_bins = (0..NUM_PERSON_SHARDS)
                 .map(|_| Vec::with_capacity(total_items / NUM_PERSON_SHARDS + 16))
-                .collect();
+                .collect::<Vec<_>>();
 
             for ts in &thread_click_shards {
                 for c in &ts[shard_idx] {
@@ -1034,26 +1055,17 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             person_bins
         })
-        .collect();
+        .collect::<Vec<_>>();
     drop(thread_click_shards);
 
     // 6. PARALLEL SESSIONIZE ACROSS ALL PERSON SHARDS WITH ZERO-HASHMAP FLAT ARRAYS
     const THIRTY_MIN_MS: i64 = 1_800_000;
     const SEVEN_DAYS_MS: i64 = 7 * 86400 * 1000;
 
-    struct UserDailyRecord<'a> {
-        person: &'a [u8],
-        day: i32,
-        sessions: i64,
-        events: i64,
-        revenue: i64,
-        top_category: Option<u8>,
-    }
-
     let cat_names_ref = &cat_names;
     let total_camp_entries = n_campaigns * n_days;
 
-    let shard_results: Vec<(Vec<UserDailyRecord>, Vec<CampaignDailyEntry>)> = (0..NUM_PERSON_SHARDS)
+    let shard_results = (0..NUM_PERSON_SHARDS)
         .into_par_iter()
         .map(|p_shard| {
             let total_events: usize = event_person_shards.iter().map(|s| s[p_shard].len()).sum();
@@ -1095,22 +1107,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let mut active_camps: Vec<u32> = Vec::with_capacity(32);
             let mut active_pos: Vec<usize> = vec![usize::MAX; n_campaigns];
 
-            struct PersonDayAgg {
-                sessions: i64,
-                events: i64,
-                revenue: i64,
-                cat_rev: [i64; MAX_CATEGORIES],
-            }
             let mut person_daily_arr: Vec<Option<PersonDayAgg>> = (0..n_days.max(1)).map(|_| None).collect();
             let mut used_days: Vec<usize> = Vec::with_capacity(n_days.min(64));
-
-            struct LocalSession {
-                start_ts: i64,
-                events: i64,
-                revenue: i64,
-                purchases: i64,
-                cat_rev: [i64; MAX_CATEGORIES],
-            }
             let mut sessions: Vec<LocalSession> = Vec::with_capacity(64);
 
             let mut p_start = 0;
@@ -1302,7 +1300,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             (user_records, camp_daily_arr)
         })
-        .collect();
+        .collect::<Vec<_>>();
 
     // 7. PARQUET OUTPUT GENERATION (PARALLEL MULTI-PART WRITERS ACROSS CORES)
     let u_dir = Path::new(&output_dir).join("user_daily");
@@ -1313,150 +1311,140 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let num_writers = 8usize;
     let shards_per_writer = NUM_PERSON_SHARDS / num_writers;
 
-    let write_user_parquet = || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        (0..num_writers).into_par_iter().for_each(|writer_idx| {
-            let start_shard = writer_idx * shards_per_writer;
-            let end_shard = start_shard + shards_per_writer;
-            let total_rows: usize = (start_shard..end_shard)
-                .map(|s| shard_results[s].0.len())
-                .sum();
+    (0..num_writers).into_par_iter().for_each(|writer_idx| {
+        let start_shard = writer_idx * shards_per_writer;
+        let end_shard = start_shard + shards_per_writer;
+        let total_rows: usize = (start_shard..end_shard)
+            .map(|s| shard_results[s].0.len())
+            .sum();
 
-            if writer_idx == 0 || total_rows > 0 {
-                let mut u_ids_b = StringBuilder::with_capacity(total_rows, total_rows * 12);
-                let mut u_top_cat_b = StringBuilder::with_capacity(total_rows, total_rows * 10);
-                let mut u_days: Vec<i32> = Vec::with_capacity(total_rows);
-                let mut u_sessions: Vec<i64> = Vec::with_capacity(total_rows);
-                let mut u_events: Vec<i64> = Vec::with_capacity(total_rows);
-                let mut u_rev: Vec<i64> = Vec::with_capacity(total_rows);
+        if writer_idx == 0 || total_rows > 0 {
+            let mut u_ids_b = StringBuilder::with_capacity(total_rows, total_rows * 12);
+            let mut u_top_cat_b = StringBuilder::with_capacity(total_rows, total_rows * 10);
+            let mut u_days: Vec<i32> = Vec::with_capacity(total_rows);
+            let mut u_sessions: Vec<i64> = Vec::with_capacity(total_rows);
+            let mut u_events: Vec<i64> = Vec::with_capacity(total_rows);
+            let mut u_rev: Vec<i64> = Vec::with_capacity(total_rows);
 
-                for s in start_shard..end_shard {
-                    for r in &shard_results[s].0 {
-                        let s_str = unsafe { std::str::from_utf8_unchecked(r.person) };
-                        u_ids_b.append_value(s_str);
-                        u_days.push(r.day);
-                        u_sessions.push(r.sessions);
-                        u_events.push(r.events);
-                        u_rev.push(r.revenue);
-                        if let Some(idx) = r.top_category {
-                            u_top_cat_b.append_value(&cat_names_ref[idx as usize]);
-                        } else {
-                            u_top_cat_b.append_null();
-                        }
+            for s in start_shard..end_shard {
+                for r in &shard_results[s].0 {
+                    let s_str = unsafe { std::str::from_utf8_unchecked(r.person) };
+                    u_ids_b.append_value(s_str);
+                    u_days.push(r.day);
+                    u_sessions.push(r.sessions);
+                    u_events.push(r.events);
+                    u_rev.push(r.revenue);
+                    if let Some(idx) = r.top_category {
+                        u_top_cat_b.append_value(&cat_names_ref[idx as usize]);
+                    } else {
+                        u_top_cat_b.append_null();
                     }
                 }
-
-                let u_schema = Arc::new(Schema::new(vec![
-                    Field::new("user_id", DataType::Utf8, false),
-                    Field::new("day", DataType::Date32, false),
-                    Field::new("sessions", DataType::Int64, false),
-                    Field::new("events", DataType::Int64, false),
-                    Field::new("revenue_cents", DataType::Int64, false),
-                    Field::new("top_category", DataType::Utf8, true),
-                ]));
-
-                let u_batch = RecordBatch::try_new(
-                    u_schema.clone(),
-                    vec![
-                        Arc::new(u_ids_b.finish()) as ArrayRef,
-                        Arc::new(Date32Array::from(u_days)) as ArrayRef,
-                        Arc::new(Int64Array::from(u_sessions)) as ArrayRef,
-                        Arc::new(Int64Array::from(u_events)) as ArrayRef,
-                        Arc::new(Int64Array::from(u_rev)) as ArrayRef,
-                        Arc::new(u_top_cat_b.finish()) as ArrayRef,
-                    ],
-                ).expect("valid user batch");
-
-                let out_file_path = u_dir.join(format!("part-{}.parquet", writer_idx));
-                let u_file = File::create(out_file_path).expect("create user parquet file");
-                let props = WriterProperties::builder()
-                    .set_compression(parquet::basic::Compression::UNCOMPRESSED)
-                    .build();
-                let mut u_writer = ArrowWriter::try_new(u_file, u_schema, Some(props)).expect("create arrow writer");
-                u_writer.write(&u_batch).expect("write user batch");
-                u_writer.close().expect("close user writer");
             }
-        });
-        Ok(())
-    };
 
-    let write_camp_parquet = || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut merged_camp_daily: Vec<CampaignDailyEntry> = vec![CampaignDailyEntry::default(); total_camp_entries];
+            let u_schema = Arc::new(Schema::new(vec![
+                Field::new("user_id", DataType::Utf8, false),
+                Field::new("day", DataType::Date32, false),
+                Field::new("sessions", DataType::Int64, false),
+                Field::new("events", DataType::Int64, false),
+                Field::new("revenue_cents", DataType::Int64, false),
+                Field::new("top_category", DataType::Utf8, true),
+            ]));
 
-        for (_, cm) in &shard_results {
-            for i in 0..total_camp_entries {
-                let v = &cm[i];
-                if v.sessions > 0 || v.assisted_sessions > 0 {
-                    let m = &mut merged_camp_daily[i];
-                    m.sessions += v.sessions;
-                    m.purchasing_sessions += v.purchasing_sessions;
-                    m.revenue += v.revenue;
-                    m.assisted_sessions += v.assisted_sessions;
-                }
+            let u_batch = RecordBatch::try_new(
+                u_schema.clone(),
+                vec![
+                    Arc::new(u_ids_b.finish()) as ArrayRef,
+                    Arc::new(Date32Array::from(u_days)) as ArrayRef,
+                    Arc::new(Int64Array::from(u_sessions)) as ArrayRef,
+                    Arc::new(Int64Array::from(u_events)) as ArrayRef,
+                    Arc::new(Int64Array::from(u_rev)) as ArrayRef,
+                    Arc::new(u_top_cat_b.finish()) as ArrayRef,
+                ],
+            ).expect("valid user batch");
+
+            let out_file_path = u_dir.join(format!("part-{}.parquet", writer_idx));
+            let u_file = File::create(out_file_path).expect("create user parquet file");
+            let props = WriterProperties::builder()
+                .set_compression(parquet::basic::Compression::UNCOMPRESSED)
+                .build();
+            let mut u_writer = ArrowWriter::try_new(u_file, u_schema, Some(props)).expect("create arrow writer");
+            u_writer.write(&u_batch).expect("write user batch");
+            u_writer.close().expect("close user writer");
+        }
+    });
+
+    let mut merged_camp_daily: Vec<CampaignDailyEntry> = vec![CampaignDailyEntry::default(); total_camp_entries];
+
+    for (_, cm) in &shard_results {
+        for i in 0..total_camp_entries {
+            let v = &cm[i];
+            if v.sessions > 0 || v.assisted_sessions > 0 {
+                let m = &mut merged_camp_daily[i];
+                m.sessions += v.sessions;
+                m.purchasing_sessions += v.purchasing_sessions;
+                m.revenue += v.revenue;
+                m.assisted_sessions += v.assisted_sessions;
             }
         }
+    }
 
-        let mut c_ids_b = StringBuilder::with_capacity(32768, 32768 * 8);
-        let mut c_channels_b = StringBuilder::with_capacity(32768, 32768 * 10);
-        let mut c_days: Vec<i32> = Vec::with_capacity(32768);
-        let mut c_sessions: Vec<i64> = Vec::with_capacity(32768);
-        let mut c_purchasing: Vec<i64> = Vec::with_capacity(32768);
-        let mut c_rev: Vec<i64> = Vec::with_capacity(32768);
-        let mut c_assisted: Vec<i64> = Vec::with_capacity(32768);
+    let mut c_ids_b = StringBuilder::with_capacity(32768, 32768 * 8);
+    let mut c_channels_b = StringBuilder::with_capacity(32768, 32768 * 10);
+    let mut c_days: Vec<i32> = Vec::with_capacity(32768);
+    let mut c_sessions: Vec<i64> = Vec::with_capacity(32768);
+    let mut c_purchasing: Vec<i64> = Vec::with_capacity(32768);
+    let mut c_rev: Vec<i64> = Vec::with_capacity(32768);
+    let mut c_assisted: Vec<i64> = Vec::with_capacity(32768);
 
-        for camp_id in 0..n_campaigns {
-            for d in 0..n_days {
-                let idx = camp_id * n_days + d;
-                let data = &merged_camp_daily[idx];
-                if data.sessions > 0 || data.assisted_sessions > 0 {
-                    let (cid_str, ch_str) = &campaign_names[camp_id];
-                    let day_epoch = w_start_day + d as i32;
-                    c_ids_b.append_value(cid_str);
-                    c_channels_b.append_value(ch_str);
-                    c_days.push(day_epoch);
-                    c_sessions.push(data.sessions);
-                    c_purchasing.push(data.purchasing_sessions);
-                    c_rev.push(data.revenue);
-                    c_assisted.push(data.assisted_sessions);
-                }
+    for camp_id in 0..n_campaigns {
+        for d in 0..n_days {
+            let idx = camp_id * n_days + d;
+            let data = &merged_camp_daily[idx];
+            if data.sessions > 0 || data.assisted_sessions > 0 {
+                let (cid_str, ch_str) = &campaign_names[camp_id];
+                let day_epoch = w_start_day + d as i32;
+                c_ids_b.append_value(cid_str);
+                c_channels_b.append_value(ch_str);
+                c_days.push(day_epoch);
+                c_sessions.push(data.sessions);
+                c_purchasing.push(data.purchasing_sessions);
+                c_rev.push(data.revenue);
+                c_assisted.push(data.assisted_sessions);
             }
         }
+    }
 
-        let c_schema = Arc::new(Schema::new(vec![
-            Field::new("campaign_id", DataType::Utf8, false),
-            Field::new("channel", DataType::Utf8, false),
-            Field::new("day", DataType::Date32, false),
-            Field::new("sessions", DataType::Int64, false),
-            Field::new("purchasing_sessions", DataType::Int64, false),
-            Field::new("revenue_cents", DataType::Int64, false),
-            Field::new("assisted_sessions", DataType::Int64, false),
-        ]));
+    let c_schema = Arc::new(Schema::new(vec![
+        Field::new("campaign_id", DataType::Utf8, false),
+        Field::new("channel", DataType::Utf8, false),
+        Field::new("day", DataType::Date32, false),
+        Field::new("sessions", DataType::Int64, false),
+        Field::new("purchasing_sessions", DataType::Int64, false),
+        Field::new("revenue_cents", DataType::Int64, false),
+        Field::new("assisted_sessions", DataType::Int64, false),
+    ]));
 
-        let c_batch = RecordBatch::try_new(
-            c_schema.clone(),
-            vec![
-                Arc::new(c_ids_b.finish()) as ArrayRef,
-                Arc::new(c_channels_b.finish()) as ArrayRef,
-                Arc::new(Date32Array::from(c_days)) as ArrayRef,
-                Arc::new(Int64Array::from(c_sessions)) as ArrayRef,
-                Arc::new(Int64Array::from(c_purchasing)) as ArrayRef,
-                Arc::new(Int64Array::from(c_rev)) as ArrayRef,
-                Arc::new(Int64Array::from(c_assisted)) as ArrayRef,
-            ],
-        )?;
+    let c_batch = RecordBatch::try_new(
+        c_schema.clone(),
+        vec![
+            Arc::new(c_ids_b.finish()) as ArrayRef,
+            Arc::new(c_channels_b.finish()) as ArrayRef,
+            Arc::new(Date32Array::from(c_days)) as ArrayRef,
+            Arc::new(Int64Array::from(c_sessions)) as ArrayRef,
+            Arc::new(Int64Array::from(c_purchasing)) as ArrayRef,
+            Arc::new(Int64Array::from(c_rev)) as ArrayRef,
+            Arc::new(Int64Array::from(c_assisted)) as ArrayRef,
+        ],
+    )?;
 
-        let c_file = File::create(c_dir.join("part-0.parquet"))?;
-        let props = WriterProperties::builder()
-            .set_compression(parquet::basic::Compression::UNCOMPRESSED)
-            .build();
-        let mut c_writer = ArrowWriter::try_new(c_file, c_schema, Some(props))?;
-        c_writer.write(&c_batch)?;
-        c_writer.close()?;
-        Ok(())
-    };
-
-    let (res_u, res_c) = rayon::join(write_user_parquet, write_camp_parquet);
-    res_u?;
-    res_c?;
+    let c_file = File::create(c_dir.join("part-0.parquet"))?;
+    let props = WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::UNCOMPRESSED)
+        .build();
+    let mut c_writer = ArrowWriter::try_new(c_file, c_schema, Some(props))?;
+    c_writer.write(&c_batch)?;
+    c_writer.close()?;
 
     Ok(())
 }
