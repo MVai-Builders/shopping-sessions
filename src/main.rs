@@ -332,7 +332,7 @@ struct FastClick<'a> {
     person: &'a [u8],
     cid: &'a [u8],
     ts: i64,
-    camp_id: u16,
+    camp_id: u32,
 }
 
 // ─── Main Pipeline ───────────────────────────────────────────────────────────
@@ -389,12 +389,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 2. Campaigns
-    let mut campaign_names: Vec<(String, String)> = Vec::with_capacity(1024);
+    let mut campaign_names: Vec<(String, String)> = Vec::with_capacity(4096);
     // Index 0 is reserved for "organic"
     campaign_names.push(("organic".to_string(), "organic".to_string()));
-    const ORGANIC_CAMP_ID: u16 = 0;
+    const ORGANIC_CAMP_ID: u32 = 0;
 
-    let mut campaign_map: HashMap<Vec<u8>, u16> = HashMap::with_capacity(1024);
+    let mut campaign_map: HashMap<Vec<u8>, u32> = HashMap::with_capacity(4096);
     let c_path = Path::new(&data_dir).join("campaigns.csv");
     if c_path.exists() {
         let content = fs::read(&c_path)?;
@@ -404,7 +404,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             if parse_line_2(line, &mut cols) && !cols[0].is_empty() {
-                let camp_id = campaign_names.len() as u16;
+                let camp_id = campaign_names.len() as u32;
                 campaign_names.push((
                     String::from_utf8_lossy(cols[0]).to_string(),
                     String::from_utf8_lossy(cols[1]).to_string(),
@@ -548,11 +548,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 locs.extend_from_slice(&ts[shard_idx]);
             }
 
-            // In-place sort by (eid_hash, ingest_ms)
+            // In-place sort by (eid_hash, eid_bytes, ingest_ms)
             locs.sort_unstable_by(|a, b| {
-                a.eid_hash
-                    .cmp(&b.eid_hash)
-                    .then_with(|| a.ingest_ms.cmp(&b.ingest_ms))
+                a.eid_hash.cmp(&b.eid_hash).then_with(|| {
+                    let line_a = &mmaps_ref[a.file_idx as usize][a.line_offset as usize..(a.line_offset + a.line_len) as usize];
+                    let line_b = &mmaps_ref[b.file_idx as usize][b.line_offset as usize..(b.line_offset + b.line_len) as usize];
+                    let mut cols_a = [b"".as_slice(); 7];
+                    let mut cols_b = [b"".as_slice(); 7];
+                    parse_line_7(line_a, &mut cols_a);
+                    parse_line_7(line_b, &mut cols_b);
+                    cols_a[0].cmp(cols_b[0]).then_with(|| a.ingest_ms.cmp(&b.ingest_ms))
+                })
             });
 
             let mut valid = Vec::with_capacity(locs.len());
@@ -743,7 +749,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         all_raw_clicks.extend(fc);
     }
 
-    all_raw_clicks.par_sort_unstable_by(|a, b| a.cid_hash.cmp(&b.cid_hash));
+    all_raw_clicks.par_sort_unstable_by(|a, b| {
+        a.cid_hash.cmp(&b.cid_hash).then_with(|| {
+            let line_a = &click_mmaps[a.f_idx as usize][a.line_offset as usize..(a.line_offset + a.line_len) as usize];
+            let line_b = &click_mmaps[b.f_idx as usize][b.line_offset as usize..(b.line_offset + b.line_len) as usize];
+            let mut cols_a = [b"".as_slice(); 4];
+            let mut cols_b = [b"".as_slice(); 4];
+            parse_line_4(line_a, &mut cols_a);
+            parse_line_4(line_b, &mut cols_b);
+            cols_a[0].cmp(cols_b[0])
+        })
+    });
 
     let mut valid_clicks: Vec<FastClick> = Vec::with_capacity(all_raw_clicks.len());
     let mut c_idx = 0;
@@ -846,7 +862,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let clicks_slice = &valid_clicks;
     let cat_names_ref = &cat_names;
 
-    let thread_results: Vec<(Vec<UserDailyRecord>, HashMap<(u16, i32), CampaignDailyEntry>)> = (0..n_threads)
+    let thread_results: Vec<(Vec<UserDailyRecord>, HashMap<(u32, i32), CampaignDailyEntry>)> = (0..n_threads)
         .into_par_iter()
         .map(|t_idx| {
             let start_idx = split_indices[t_idx];
@@ -857,7 +873,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let t_events = &valid_events[start_idx..end_idx];
             let mut user_records = Vec::with_capacity(t_events.len() / 15);
-            let mut camp_map: HashMap<(u16, i32), CampaignDailyEntry> = HashMap::with_capacity(16384);
+            let mut camp_map: HashMap<(u32, i32), CampaignDailyEntry> = HashMap::with_capacity(16384);
 
             let mut p_start = 0;
             while p_start < t_events.len() {
@@ -894,7 +910,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                            s_purchases: i64,
                                            s_cat_rev: [i64; 32],
                                            p_daily: &mut HashMap<i32, PersonDayAgg>,
-                                           c_map: &mut HashMap<(u16, i32), CampaignDailyEntry>| {
+                                           c_map: &mut HashMap<(u32, i32), CampaignDailyEntry>| {
                     let day_epoch = (s_start_ts.div_euclid(86_400_000)) as i32;
 
                     let pd = p_daily.entry(day_epoch).or_insert_with(|| PersonDayAgg {
@@ -910,18 +926,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         pd.cat_rev[i] += s_cat_rev[i];
                     }
 
-                    let mut best_click: Option<(i64, &[u8], u16)> = None;
-                    let mut assisting_camps = [false; 1024];
-                    let mut has_assisted = false;
+                    let mut best_click: Option<(i64, &[u8], u32)> = None;
+                    let mut assisting_camps: Vec<u32> = Vec::with_capacity(8);
 
                     for c in person_clicks {
                         if c.ts > s_start_ts {
                             break;
                         }
                         if (s_start_ts - c.ts) <= SEVEN_DAYS_MS {
-                            if (c.camp_id as usize) < assisting_camps.len() {
-                                assisting_camps[c.camp_id as usize] = true;
-                                has_assisted = true;
+                            if !assisting_camps.contains(&c.camp_id) {
+                                assisting_camps.push(c.camp_id);
                             }
                             if let Some(best) = &mut best_click {
                                 if c.ts > best.0 {
@@ -948,18 +962,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     cd.revenue += s_rev;
 
-                    if has_assisted {
-                        for camp_id in 1..assisting_camps.len() {
-                            if assisting_camps[camp_id] {
-                                let ac = c_map.entry((camp_id as u16, day_epoch)).or_insert_with(|| CampaignDailyEntry {
-                                    sessions: 0,
-                                    purchasing_sessions: 0,
-                                    revenue: 0,
-                                    assisted_sessions: 0,
-                                });
-                                ac.assisted_sessions += 1;
-                            }
-                        }
+                    for &camp_id in &assisting_camps {
+                        let ac = c_map.entry((camp_id, day_epoch)).or_insert_with(|| CampaignDailyEntry {
+                            sessions: 0,
+                            purchasing_sessions: 0,
+                            revenue: 0,
+                            assisted_sessions: 0,
+                        });
+                        ac.assisted_sessions += 1;
                     }
                 };
 
@@ -1044,7 +1054,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut u_rev: Vec<i64> = Vec::with_capacity(total_user_rows);
     let mut u_top_cat: Vec<Option<String>> = Vec::with_capacity(total_user_rows);
 
-    let mut merged_campaign_daily: HashMap<(u16, i32), CampaignDailyEntry> = HashMap::with_capacity(32768);
+    let mut merged_campaign_daily: HashMap<(u32, i32), CampaignDailyEntry> = HashMap::with_capacity(32768);
 
     for (ur, cm) in thread_results {
         for r in ur {
