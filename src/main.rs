@@ -360,6 +360,43 @@ impl Dsu {
 // ─── Internal Zero-Copy Data Structures ──────────────────────────────────────
 
 #[derive(Clone, Copy)]
+struct FileChunk<'a> {
+    data: &'a [u8],
+    skip_header: bool,
+}
+
+fn create_chunks<'a>(bytes: &'a [u8], chunk_size: usize) -> Vec<FileChunk<'a>> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut is_first = true;
+
+    while start < bytes.len() {
+        let target_end = (start + chunk_size).min(bytes.len());
+        let end = if target_end < bytes.len() {
+            match memchr::memchr(b'\n', &bytes[target_end..]) {
+                Some(pos) => target_end + pos + 1,
+                None => bytes.len(),
+            }
+        } else {
+            bytes.len()
+        };
+
+        chunks.push(FileChunk {
+            data: &bytes[start..end],
+            skip_header: is_first,
+        });
+
+        start = end;
+        is_first = false;
+    }
+
+    chunks
+}
+
+#[derive(Clone, Copy)]
 struct RawEvent<'a> {
     eid_hash: u64,
     ingest_ms: i64,
@@ -417,6 +454,8 @@ const NUM_EVENT_SHARDS: usize = 16;
 const NUM_PERSON_SHARDS: usize = 16;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let start_total = std::time::Instant::now();
+
     let args: Vec<String> = env::args().collect();
     let (data_dir, output_dir) = if args.len() >= 3 {
         (args[1].clone(), args[2].clone())
@@ -536,22 +575,32 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         })
         .collect();
 
-    let thread_event_shards: Vec<Vec<Vec<RawEvent>>> = mmaps
+    const CHUNK_SIZE: usize = 2 * 1024 * 1024;
+
+    let mut event_chunks = Vec::new();
+    for mmap in &mmaps {
+        event_chunks.extend(create_chunks(mmap.as_ref(), CHUNK_SIZE));
+    }
+
+    let thread_event_shards: Vec<Vec<Vec<RawEvent>>> = event_chunks
         .par_iter()
-        .map(|mmap| {
+        .map(|chunk| {
             let mut shards: Vec<Vec<RawEvent>> = (0..NUM_EVENT_SHARDS)
-                .map(|_| Vec::with_capacity(mmap.len() / (80 * NUM_EVENT_SHARDS)))
+                .map(|_| Vec::with_capacity(chunk.data.len() / (80 * NUM_EVENT_SHARDS)))
                 .collect();
             let mut cols = [b"".as_slice(); 7];
-            let bytes = mmap.as_ref();
+            let bytes = chunk.data;
             let mut start = 0;
-            let mut line_num = 0;
+            let mut is_first_line = chunk.skip_header;
 
             for end in memchr::memchr_iter(b'\n', bytes) {
                 let line = &bytes[start..end];
                 start = end + 1;
-                line_num += 1;
-                if line_num == 1 || line.is_empty() {
+                if is_first_line {
+                    is_first_line = false;
+                    continue;
+                }
+                if line.is_empty() {
                     continue;
                 }
                 if parse_line_7(line, &mut cols) {
@@ -576,7 +625,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             if start < bytes.len() {
                 let line = &bytes[start..];
-                if line_num > 0 && !line.is_empty() && parse_line_7(line, &mut cols) {
+                if !is_first_line && !line.is_empty() && parse_line_7(line, &mut cols) {
                     let eid = cols[0];
                     if !eid.is_empty() {
                         if let Some(ingest_ms) = parse_iso_f1(cols[3]) {
@@ -615,22 +664,30 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         })
         .collect();
 
-    let thread_click_shards: Vec<Vec<Vec<RawClick>>> = click_mmaps
+    let mut click_chunks = Vec::new();
+    for mmap in &click_mmaps {
+        click_chunks.extend(create_chunks(mmap.as_ref(), CHUNK_SIZE));
+    }
+
+    let thread_click_shards: Vec<Vec<Vec<RawClick>>> = click_chunks
         .par_iter()
-        .map(|mmap| {
+        .map(|chunk| {
             let mut shards: Vec<Vec<RawClick>> = (0..NUM_EVENT_SHARDS)
-                .map(|_| Vec::with_capacity(mmap.len() / (60 * NUM_EVENT_SHARDS)))
+                .map(|_| Vec::with_capacity(chunk.data.len() / (60 * NUM_EVENT_SHARDS)))
                 .collect();
             let mut cols = [b"".as_slice(); 4];
-            let bytes = mmap.as_ref();
+            let bytes = chunk.data;
             let mut start = 0;
-            let mut line_num = 0;
+            let mut is_first_line = chunk.skip_header;
 
             for end in memchr::memchr_iter(b'\n', bytes) {
                 let line = &bytes[start..end];
                 start = end + 1;
-                line_num += 1;
-                if line_num == 1 || line.is_empty() {
+                if is_first_line {
+                    is_first_line = false;
+                    continue;
+                }
+                if line.is_empty() {
                     continue;
                 }
                 if parse_line_4(line, &mut cols) {
@@ -650,7 +707,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             if start < bytes.len() {
                 let line = &bytes[start..];
-                if line_num > 0 && !line.is_empty() && parse_line_4(line, &mut cols) {
+                if !is_first_line && !line.is_empty() && parse_line_4(line, &mut cols) {
                     let cid = cols[0];
                     if !cid.is_empty() {
                         let cid_hash = fnv1a(cid);
@@ -1274,6 +1331,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (res_u, res_c) = rayon::join(write_user_parquet, write_camp_parquet);
     res_u?;
     res_c?;
+
+    eprintln!("[STAGE] Total runtime: {:?}", start_total.elapsed());
 
     Ok(())
 }
