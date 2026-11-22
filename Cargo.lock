@@ -884,6 +884,7 @@ dependencies = [
  "arrow",
  "glob",
  "hashbrown",
+ "memchr",
  "memmap2",
  "parquet",
  "rayon",
